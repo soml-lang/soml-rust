@@ -1,0 +1,53 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-features
+      # The `jiff` and `chrono` features are optional, so the crate and its tests must also build without them.
+      - run: cargo test --locked
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all --all-features --tests -- -D warnings
+      # Catches intra-doc links that no longer resolve, which clippy does not check.
+      - run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # `cargo package` only builds, so a missing `include` entry would ship a crate whose tests cannot compile. The dedicated target directory keeps the glob below from picking up a stale package.
+      - name: Test the packaged crate
+        run: |
+          cargo package --locked --target-dir "$RUNNER_TEMP/package"
+          cd "$RUNNER_TEMP"/package/package/soml-lang-*/
+          cargo test --locked --all-features
+  # The declared `rust-version`, which `test` does not cover.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-features
+  # A short run of every fuzz target, which finds what the tests do not try. The corpus folder is not in Git, so each target starts from the conformance cases.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Fuzz each target for 60 seconds
+        run: |
+          for target in read document change format; do
+            mkdir -p "fuzz/corpus/$target"
+            find tests/conformance -name '*.soml' -exec cp {} "fuzz/corpus/$target/" \;
+            cargo fuzz run "$target" -- -max_total_time=60 -max_len=4096
+          done

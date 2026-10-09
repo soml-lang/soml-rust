@@ -1,5 +1,7 @@
+use crate::parse::MAX_DEPTH;
 use crate::tree::{self, Comment, Decor, Entries, Entry, Item, Key, Member, Node, Object, Printer};
 use crate::{Error, Value};
+use std::borrow::Cow;
 use std::fmt::{self, Display, Write as _};
 use std::str::FromStr;
 
@@ -79,6 +81,23 @@ impl Display for PathSegment<'_> {
 			Self::Index(index) => write!(formatter, "[{index}]"),
 		}
 	}
+}
+
+/**
+The segments of a path given to `set` or `remove`, which must have at least one.
+*/
+fn path_segments<'a>(
+	path: impl IntoIterator<Item = impl Into<PathSegment<'a>>>,
+) -> Result<Vec<PathSegment<'a>>, Error> {
+	let path: Vec<PathSegment<'a>> = path.into_iter().map(Into::into).collect();
+
+	if path.is_empty() {
+		return Err(Error::data(
+			"The path must be a non-empty array of keys and array indexes",
+		));
+	}
+
+	Ok(path)
 }
 
 /**
@@ -208,6 +227,20 @@ fn last_line_start(decor: &str) -> Option<usize> {
 }
 
 /**
+The error for a path segment at `offset` in `path` that does not fit `node`: an index for an object, a key for an array, or any segment for a scalar.
+*/
+#[cold]
+fn segment_error(node: &Node, path: &[PathSegment<'_>], offset: usize) -> Error {
+	let reason = match node {
+		Node::Object(_) => "is an object, so it needs a key, not an index",
+		Node::Array(_) => "is an array, so it needs an index, not a key",
+		Node::Scalar(_) => "is not an object or an array",
+	};
+
+	path_error(path, offset, reason)
+}
+
+/**
 The position of the member or item that a path segment names in a node.
 */
 fn step(node: &Node, segment: PathSegment<'_>) -> Option<usize> {
@@ -323,13 +356,7 @@ impl Document {
 		path: impl IntoIterator<Item = impl Into<PathSegment<'a>>>,
 		value: impl Into<Value>,
 	) -> Result<(), Error> {
-		let path: Vec<PathSegment<'a>> = path.into_iter().map(Into::into).collect();
-
-		if path.is_empty() {
-			return Err(Error::data(
-				"The path must be a non-empty array of keys and array indexes",
-			));
-		}
+		let path = path_segments(path)?;
 
 		// Every key the change may write is checked up front, also one it nests in a new object, which no `Member::new` checks, so a key that cannot be written always gives the same error.
 		for segment in &path {
@@ -340,7 +367,9 @@ impl Document {
 
 		let value = tree::checked(value.into())?;
 		let before = self.root.clone();
-		let result = set_in(&mut self.root, &path, &path, value, "", false);
+		// A document indented like the code around it, as in `\t{}`, gets new lines at the indentation of its top-level collection's line. The outer decor is empty for a top-level object without braces.
+		let indentation = tree::indentation_of(own_line(&self.outer.leading)).to_owned();
+		let result = set_in(&mut self.root, &path, &path, value, &indentation, false);
 
 		// Every rule of the spec is checked by reading the result back, such as the nesting limit at the place the value goes, and a key that cannot be written. A failed change leaves the document as it was. The error has no position, because its position is in the text the change would have made, which nobody sees.
 		if let Err(error) = result.and_then(|()| {
@@ -374,13 +403,7 @@ impl Document {
 		&mut self,
 		path: impl IntoIterator<Item = impl Into<PathSegment<'a>>>,
 	) -> Result<bool, Error> {
-		let path: Vec<PathSegment<'a>> = path.into_iter().map(Into::into).collect();
-
-		if path.is_empty() {
-			return Err(Error::data(
-				"The path must be a non-empty array of keys and array indexes",
-			));
-		}
+		let path = path_segments(path)?;
 
 		// A top-level object without braces needs a member, so when its only member goes, `{}` takes its place, with its decor, and members set later go inside the braces, as in the JavaScript reference.
 		if let Node::Object(object) = &mut self.root
@@ -397,6 +420,7 @@ impl Document {
 			return Ok(true);
 		}
 
+		// `remove_in` fails only before it changes anything, so unlike `set`, this keeps no copy to restore.
 		remove_in(&mut self.root, &path, &path)
 	}
 
@@ -496,19 +520,39 @@ fn new_node(value: Value, indentation: &str, is_one_line: bool) -> Node {
 `value` inside new objects for the keys of `path` from `start` on, with braces, as canonical form writes a missing parent. An index there names an item of an array that does not exist yet, so it is an error, which names the last such index, as in the JavaScript reference.
 */
 fn nest(path: &[PathSegment<'_>], start: usize, value: Value) -> Result<Value, Error> {
-	(start..path.len())
+	// The index error comes before the depth check, so that it names the index however long the path is, and before any object is made, because dropping a deep value could overflow the stack.
+	if let Some((position, index)) =
+		path.iter()
+			.enumerate()
+			.skip(start)
+			.rev()
+			.find_map(|(position, segment)| match segment {
+				PathSegment::Index(index) => Some((position, index)),
+				PathSegment::Key(_) => None,
+			}) {
+		return Err(path_error(
+			path,
+			position,
+			&format!("does not exist, so it has no index {index}"),
+		));
+	}
+
+	// The value goes inside one collection for each segment of the path, so a path longer than the nesting limit can only give a document that no reader accepts, and building its objects one inside the other could overflow the stack.
+	if path.len() > MAX_DEPTH {
+		return Err(Error::write(format!(
+			"The document is nested more than {MAX_DEPTH} levels deep"
+		)));
+	}
+
+	Ok(path[start..]
+		.iter()
 		.rev()
-		.try_fold(value, |value, position| match path[position] {
-			PathSegment::Key(key) => Ok(Value::Object(crate::Object::from([(
-				key.to_owned(),
-				value,
-			)]))),
-			PathSegment::Index(index) => Err(path_error(
-				path,
-				position,
-				&format!("does not exist, so it has no index {index}"),
-			)),
-		})
+		.fold(value, |value, segment| match segment {
+			PathSegment::Key(key) => {
+				Value::Object(crate::Object::from([((*key).to_owned(), value)]))
+			}
+			PathSegment::Index(_) => unreachable!("an index is an error above"),
+		}))
 }
 
 /**
@@ -522,23 +566,27 @@ fn set_in(
 	indentation: &str,
 	is_inside_one_line: bool,
 ) -> Result<(), Error> {
+	// The end of the path, where the value replaces `node`. It is on one line inside a container that stays on one line.
+	if path.is_empty() {
+		*node = new_node(value, indentation, is_inside_one_line);
+		return Ok(());
+	}
+
 	let is_one_line = is_inside_one_line || stays_on_one_line(node);
 	// Where `path` starts in `full_path`.
 	let offset = full_path.len() - path.len();
 
-	match node {
-		Node::Object(object) => {
-			set_in_object(object, path, full_path, value, indentation, is_one_line)
-		}
-		Node::Array(array) => {
-			let PathSegment::Index(index) = path[0] else {
-				return Err(path_error(
-					full_path,
-					offset,
-					"is an array, so it needs an index, not a key",
-				));
-			};
-
+	match (node, path[0]) {
+		(Node::Object(object), PathSegment::Key(key)) => set_in_object(
+			object,
+			key,
+			path,
+			full_path,
+			value,
+			indentation,
+			is_one_line,
+		),
+		(Node::Array(array), PathSegment::Index(index)) => {
 			let count = array.items().len();
 
 			if index > count {
@@ -561,6 +609,7 @@ fn set_in(
 			// An index equal to the length appends, and the rest of the path is new objects in the new item, as in the JavaScript reference.
 			if index == count {
 				let value = nest(full_path, offset + 1, value)?;
+				// The null is a placeholder: `insert` puts the new value in its place, laid out for its line.
 				let item = Item::new(Value::Null).expect("null can be written");
 				array
 					.entries_mut()
@@ -569,15 +618,9 @@ fn set_in(
 			}
 
 			let item_indentation = entry_indentation(array.items(), index, false, indentation);
-			let item = &mut array.items_mut()[index];
-
-			if path.len() == 1 {
-				*item.value_mut() = new_node(value, &item_indentation, is_one_line);
-				return Ok(());
-			}
 
 			set_in(
-				item.value_mut(),
+				array.items_mut()[index].value_mut(),
 				&path[1..],
 				full_path,
 				value,
@@ -585,16 +628,16 @@ fn set_in(
 				is_one_line,
 			)
 		}
-		Node::Scalar(_) => Err(path_error(
-			full_path,
-			offset,
-			"is not an object or an array",
-		)),
+		(node, _) => Err(segment_error(node, full_path, offset)),
 	}
 }
 
+/**
+Sets `value` at `path` inside `object`, where `key` is the first segment of `path`.
+*/
 fn set_in_object(
 	object: &mut Object,
+	key: &str,
 	path: &[PathSegment<'_>],
 	full_path: &[PathSegment<'_>],
 	value: Value,
@@ -602,14 +645,6 @@ fn set_in_object(
 	is_one_line: bool,
 ) -> Result<(), Error> {
 	let offset = full_path.len() - path.len();
-
-	let PathSegment::Key(key) = path[0] else {
-		return Err(path_error(
-			full_path,
-			offset,
-			"is an object, so it needs a key, not an index",
-		));
-	};
 
 	if let Some(index) = object.position(key) {
 		let member = &mut object.members_mut()[index];
@@ -622,7 +657,7 @@ fn set_in_object(
 				.bytes()
 				.all(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
 		{
-			member.after_colon = " ".to_owned();
+			member.after_colon = Cow::Borrowed(" ");
 		}
 
 		// A value on the line after its key, because a comment comes between them, is indented like its own line.
@@ -630,15 +665,9 @@ fn set_in_object(
 			&object.members()[index].after_colon,
 			&entry_indentation(object.members(), index, !object.is_braced(), indentation),
 		);
-		let member = &mut object.members_mut()[index];
-
-		if path.len() == 1 {
-			*member.value_mut() = new_node(value, &member_indentation, is_one_line);
-			return Ok(());
-		}
 
 		return set_in(
-			member.value_mut(),
+			object.members_mut()[index].value_mut(),
 			&path[1..],
 			full_path,
 			value,
@@ -648,6 +677,7 @@ fn set_in_object(
 	}
 
 	let value = nest(full_path, offset + 1, value)?;
+	// The null is a placeholder, as for a new item.
 	let member = Member::new(Key::new(key), Value::Null)?;
 	let count = object.members().len();
 	object
@@ -735,16 +765,39 @@ fn end_line<T: Entry>(kept: &mut [T], moved: &mut String) {
 
 impl<T: Entry> Entries<'_, T> {
 	/**
+	Moves the line feed that ends the last entry's line from the closing decor to the entry's trailing decor, where the parser puts it. An entry pushed through the node API has no decor, so that line feed can be in the closing decor, and then the entry would be taken as followed by something on its line, and the comment lines after it as its own.
+	*/
+	fn end_last_line(&mut self) {
+		let Some(last) = self.list.last_mut() else {
+			return;
+		};
+
+		if last.separator().decor.trailing.ends_with('\n') {
+			return;
+		}
+
+		let line_feed = tree::first_line_end(self.closing);
+
+		if let Some(line_feed) = line_feed {
+			last.separator_mut()
+				.decor
+				.trailing
+				.extend(self.closing.drain(..line_feed));
+		}
+	}
+
+	/**
 	Inserts an entry with a value at `index`, as in the JavaScript reference. When something follows the entry before it on its line, such as the closing bracket, the new entry goes on that line after a comma, in the comma style of that entry. Otherwise, it goes on a line of its own with no comma, as a line break separates it, and so does an entry in an empty container, unless the container stays on one line. `indentation` is that of the container's line, and `is_one_line` is whether the container stays on one line, which keeps the new value on one line too.
 	*/
 	fn insert(
-		self,
+		mut self,
 		index: usize,
 		mut entry: T,
 		value: Value,
 		indentation: &str,
 		is_one_line: bool,
 	) {
+		self.end_last_line();
 		let Self {
 			list: entries,
 			closing,
@@ -786,6 +839,7 @@ impl<T: Entry> Entries<'_, T> {
 					(line.clone(), String::new(), false, line)
 				}
 			}
+			// Only a change through the node API can empty a top-level object without braces, because `remove` puts `{}` in place of its last member.
 			None if !is_braced => (String::new(), "\n".to_owned(), false, String::new()),
 			// A container that stays on one line keeps the new entry on that line, before the closing bracket, so `[/* note */]` becomes `[/* note */ 1]`, and `[1, []]` becomes `[1, [2]]`.
 			None if is_one_line => {
@@ -842,16 +896,9 @@ fn remove_in(
 	// Where `path` starts in `full_path`.
 	let offset = full_path.len() - path.len();
 
-	match node {
-		Node::Object(object) => {
-			let PathSegment::Key(key) = path[0] else {
-				return Err(path_error(
-					full_path,
-					offset,
-					"is an object, so it needs a key, not an index",
-				));
-			};
-
+	// The path is never empty here: `path_segments` checks it, and a recursive call gets at least one segment.
+	match (node, path[0]) {
+		(Node::Object(object), PathSegment::Key(key)) => {
 			// Removing a member that is not there changes nothing, and so does removing something below it.
 			let Some(index) = object.position(key) else {
 				return Ok(false);
@@ -869,15 +916,7 @@ fn remove_in(
 				.entries_mut()
 				.remove_where(|position, _| position == index))
 		}
-		Node::Array(array) => {
-			let PathSegment::Index(index) = path[0] else {
-				return Err(path_error(
-					full_path,
-					offset,
-					"is an array, so it needs an index, not a key",
-				));
-			};
-
+		(Node::Array(array), PathSegment::Index(index)) => {
 			// Removing an item that is not there changes nothing, at the end of the array or past it, and so does removing something below it.
 			if index >= array.items().len() {
 				return Ok(false);
@@ -891,11 +930,7 @@ fn remove_in(
 				.entries_mut()
 				.remove_where(|position, _| position == index))
 		}
-		Node::Scalar(_) => Err(path_error(
-			full_path,
-			offset,
-			"is not an object or an array",
-		)),
+		(node, _) => Err(segment_error(node, full_path, offset)),
 	}
 }
 
@@ -903,7 +938,8 @@ impl<T: Entry> Entries<'_, T> {
 	/**
 	Removes the entries that `is_removed` picks, in one pass, and returns whether there were any. A removed entry takes the comments it owns, which are its decor on its own line and, for the last entry, the closing decor on its line. The comment lines above a removed entry stay, and move to the start of the next entry's leading decor, or to the container's closing decor when no entry follows. When the removed entry was the first, the next one takes its place on its line. A removed entry takes its comma. When the removed entries are the last ones and the last of them has no comma, the comma directly before them goes too, when only spaces, tabs, and the comments the first of them owns are between, so `[1, 2]` and `[1, /* note */ 2]` become `[1]`, as in the JavaScript reference.
 	*/
-	fn remove_where(self, mut is_removed: impl FnMut(usize, &T) -> bool) -> bool {
+	fn remove_where(mut self, mut is_removed: impl FnMut(usize, &T) -> bool) -> bool {
+		self.end_last_line();
 		let Self {
 			list: entries,
 			closing,
@@ -1041,9 +1077,7 @@ impl<T: Entry> Entries<'_, T> {
 				let text = before_comma.trim_end_matches([' ', '\t']).to_owned()
 					+ &separator.decor.trailing;
 				// Without a line feed, all of it is before the closing bracket, on the entry's line, which the parser gives to the container.
-				let line_end = tree::decor_parts(&text)
-					.find(|(part, _)| *part == tree::DecorPart::LineFeed)
-					.map_or(0, |(_, range)| range.end);
+				let line_end = tree::first_line_end(&text).unwrap_or(0);
 				separator.decor.trailing = text[..line_end].to_owned();
 				closing.insert_str(0, &text[line_end..]);
 			}
@@ -1126,6 +1160,7 @@ fn without_extra_blank_lines(
 	let end_run =
 		|output: &mut String, run: std::ops::Range<usize>, is_at_start: bool, is_at_end: bool| {
 			// The offsets are in order, so a binary search keeps a removal of many entries linear.
+			// An entry removed at `run.start` or at `run.end` counts as in the run.
 			let first = removed_at.partition_point(|&offset| offset < run.start);
 			let last = removed_at.partition_point(|&offset| offset <= run.end);
 
@@ -1140,6 +1175,7 @@ fn without_extra_blank_lines(
 			let mut before = run.start..first_removed;
 			let mut after = last_removed..run.end;
 
+			// Both ranges start and end at line starts, so each branch removes one whole blank line: the last one before the removed entries, or else the first one after them.
 			if !before.is_empty() && (!after.is_empty() || is_at_end) {
 				before.end = decor[before.start..before.end - 1]
 					.rfind('\n')
@@ -1199,8 +1235,7 @@ impl FromStr for Document {
 	Parses a document, with the same checks and errors as [`from_str`](crate::from_str).
 	*/
 	fn from_str(text: &str) -> Result<Self, Error> {
-		crate::parse::parse(text)?;
-		let parts = tree::build(text);
+		let parts = tree::build(text, crate::parse::parse(text)?);
 
 		Ok(Self {
 			outer: parts.outer,

@@ -237,7 +237,7 @@ fn a_float_reads_into_f64_and_f32() {
 
 #[test]
 fn a_float_too_large_for_f32_reads_as_infinity() {
-	// The plan does not decide this. serde's f32 visitor narrows the f64 with `as`, as serde_json does.
+	// The plan does not decide this. The digits of 1e300 read as an f32 give infinity, as `as` does in serde_json.
 	assert_eq!(read::<f32>("a: 1e300").expect("f32"), f32::INFINITY);
 }
 
@@ -269,6 +269,51 @@ fn f32_reads_back_exactly_from_its_written_form() {
 		let read_back = read::<f32>(&text).expect("an f32 reads back");
 		assert_eq!(read_back.to_bits(), value.to_bits(), "{text}");
 	}
+}
+
+#[test]
+fn a_float_reads_into_f32_rounded_once_from_its_text() {
+	// Each is nearest to an f64 that is halfway between two f32 values, or is that halfway point, so rounding through an f64 gives the wrong one.
+	for (text, expected) in [
+		// The halfway point between 1 + 2^-23 and 1 + 2^-22, which rounds to the even one.
+		("1.000000178813934326171875", 1.000_000_2_f32),
+		("1.000000178813934326171875000001", 1.000_000_2),
+		(
+			"1.0000001788139343253045132620115964527940377593040466308593749",
+			1.000_000_1,
+		),
+		("1.000_000_178_813_934_326_171_875_000_001", 1.000_000_2),
+		("-1.000000178813934326171875000001", -1.000_000_2),
+		("16777217.000000000001", 16_777_218.0),
+		("1.6777217000000000001e7", 16_777_218.0),
+		// Just above half of the smallest f32, and just below the f32 overflow threshold.
+		(
+			"7.0064923216240853546186479164495806564013097093825788587853414194489554134293030074331909418106079101562501e-46",
+			f32::from_bits(1),
+		),
+		("3.40282356779733661637539395458142568447e38", f32::MAX),
+	] {
+		assert_eq!(
+			read::<f32>(&format!("a: {text}")).expect("f32").to_bits(),
+			expected.to_bits(),
+			"{text}"
+		);
+		assert_eq!(
+			soml::from_str::<Vec<soml::Spanned<f32>>>(&format!("[{text}]")).expect("f32")[0]
+				.to_bits(),
+			expected.to_bits(),
+			"{text}"
+		);
+	}
+
+	// Zero has one value whatever its sign, also in an f32.
+	assert_eq!(read::<f32>("a: -0.0").expect("f32").to_bits(), 0);
+	assert_eq!(read::<f32>("a: -1e-50").expect("f32").to_bits(), 0);
+	assert_eq!(read::<f32>("a: infinity").expect("f32"), f32::INFINITY);
+	assert_eq!(
+		read::<Option<f32>>("a: 1_000.5").expect("f32"),
+		Some(1000.5)
+	);
 }
 
 #[test]
@@ -934,6 +979,136 @@ fn a_duplicate_key_on_serialize_is_an_error() {
 			.to_string(),
 		"Duplicate key “a”"
 	);
+}
+
+#[test]
+fn a_type_that_catches_an_error_and_keeps_writing_gets_what_the_tree_gives() {
+	use serde::ser::{SerializeMap, SerializeSeq};
+
+	/**
+	Writes the entries that it can, and skips the one that fails by catching the error.
+	*/
+	struct SkipsEntry;
+
+	impl Serialize for SkipsEntry {
+		fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+			let mut map = serializer.serialize_map(None)?;
+			let _ = map.serialize_entry("bad", &f64::NAN);
+			map.serialize_entry("good", &1)?;
+			map.end()
+		}
+	}
+
+	/**
+	The same for the items of an array.
+	*/
+	struct SkipsItem;
+
+	impl Serialize for SkipsItem {
+		fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+			let mut sequence = serializer.serialize_seq(None)?;
+			let _ = sequence.serialize_element(&f64::NAN);
+			sequence.serialize_element(&2)?;
+			sequence.end()
+		}
+	}
+
+	// Each one alone, because a failure that one way does not catch can come back through the other.
+	assert_eq!(
+		soml::to_string(&SkipsEntry).expect("the error is caught"),
+		"good: 1\n"
+	);
+	assert_eq!(
+		soml::to_string(&SkipsItem).expect("the error is caught"),
+		"[\n\t2\n]\n"
+	);
+}
+
+#[test]
+fn a_wrong_length_hint_on_serialize_is_only_a_hint() {
+	use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
+
+	struct Hinted;
+
+	impl Serialize for Hinted {
+		fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+			let mut object = serializer.serialize_struct("Hinted", usize::MAX)?;
+			object.serialize_field("map", &Map)?;
+			object.serialize_field("seq", &Seq)?;
+			object.end()
+		}
+	}
+
+	struct Map;
+
+	impl Serialize for Map {
+		fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+			serializer.serialize_map(Some(usize::MAX))?.end()
+		}
+	}
+
+	struct Seq;
+
+	impl Serialize for Seq {
+		fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+			serializer.serialize_seq(Some(usize::MAX))?.end()
+		}
+	}
+
+	assert_eq!(
+		soml::to_string(&Hinted).expect("a hint is not a promise"),
+		"map: {}\nseq: []\n"
+	);
+}
+
+#[test]
+fn a_duplicate_key_is_found_in_an_object_of_any_size() {
+	// The readers and writers compare keys only when a filter finds a possible duplicate, and use a set past 32 keys, so both ways are tried, with a duplicate of the first and of the last key.
+	struct Entries(Vec<String>);
+
+	impl Serialize for Entries {
+		fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+			serializer.collect_map(self.0.iter().map(|key| (key, 1)))
+		}
+	}
+
+	for count in [3, 31, 32, 33, 100] {
+		let keys: Vec<String> = (0..count).map(|index| format!("key{index}")).collect();
+		let text: String = keys.iter().map(|key| format!("{key}: 1\n")).collect();
+
+		assert!(soml::from_str::<serde::de::IgnoredAny>(&text).is_ok());
+		assert_eq!(
+			soml::to_string(&Entries(keys.clone())).expect("no duplicate"),
+			text
+		);
+
+		for duplicate in [&keys[0], &keys[count - 1]] {
+			let text = format!("{text}{duplicate}: 2\n");
+			let message = format!("Duplicate key {duplicate} at line {}, column 1", count + 1);
+
+			assert_eq!(
+				soml::from_str::<serde::de::IgnoredAny>(&text)
+					.expect_err("a duplicate")
+					.to_string(),
+				message
+			);
+			assert_eq!(
+				soml::from_str::<BTreeMap<String, i32>>(&text)
+					.expect_err("a duplicate")
+					.to_string(),
+				message
+			);
+
+			let mut entries = keys.clone();
+			entries.push(duplicate.clone());
+			assert_eq!(
+				soml::to_string(&Entries(entries))
+					.expect_err("a duplicate")
+					.to_string(),
+				format!("Duplicate key “{duplicate}”")
+			);
+		}
+	}
 }
 
 #[test]
@@ -1738,4 +1913,256 @@ fn a_user_struct_named_duration_that_is_not_a_std_duration_is_an_object() {
 			duration
 		);
 	}
+}
+
+#[test]
+fn f32_reads_from_its_shortest_digits() {
+	// Narrowing the f64 of this text rounds to the f32 next to the one it names.
+	assert_eq!(
+		read::<f32>("a: 7.038531e-26").expect("f32"),
+		f32::from_bits(0x15AE_43FD)
+	);
+	assert_eq!(
+		read::<f32>("a: -7.038531e-26").expect("f32"),
+		-f32::from_bits(0x15AE_43FD)
+	);
+	assert_eq!(read::<f32>("a: 1_000.5").expect("f32"), 1000.5);
+	assert_eq!(
+		soml::from_value::<f32>(Value::from(f32::from_bits(0x15AE_43FD))).expect("f32"),
+		f32::from_bits(0x15AE_43FD)
+	);
+	assert_eq!(
+		read::<f32>("a: -0.0").expect("f32").to_bits(),
+		0.0f32.to_bits()
+	);
+	assert_eq!(read::<f32>("a: 1e300").expect("f32"), f32::INFINITY);
+}
+
+#[test]
+fn adjacently_tagged_content_first_keeps_soml_types_and_spans() {
+	#[derive(Serialize, Deserialize, Debug, PartialEq)]
+	#[serde(tag = "t", content = "c")]
+	enum Event {
+		Wait(std::time::Duration),
+		Spot(soml::Spanned<u16>),
+	}
+
+	#[derive(Serialize, Deserialize, Debug, PartialEq)]
+	struct Config {
+		a: Event,
+	}
+
+	let config = Config {
+		a: Event::Wait(std::time::Duration::from_secs(90)),
+	};
+	let text = soml::to_string_canonical(&config).expect("written");
+	assert_eq!(text, "a: {\n\tc: 1m30s\n\tt: 'Wait'\n}\n");
+	assert_eq!(soml::from_str::<Config>(&text).expect("read"), config);
+
+	let Event::Spot(port) = soml::from_str::<Config>("a: {c: 8080, t: 'Spot'}")
+		.expect("read")
+		.a
+	else {
+		panic!("expected Spot");
+	};
+	assert_eq!(port.span(), Some(7..11));
+}
+
+#[test]
+fn a_type_that_swallows_an_error_still_gets_the_syntax_error_of_the_document() {
+	fn or_default<'de, D: serde::Deserializer<'de>, T: Deserialize<'de> + Default>(
+		deserializer: D,
+	) -> Result<T, D::Error> {
+		Ok(T::deserialize(deserializer).unwrap_or_default())
+	}
+
+	#[derive(Deserialize, Debug, PartialEq)]
+	struct Config {
+		#[serde(deserialize_with = "or_default")]
+		a: Vec<u32>,
+		b: u32,
+	}
+
+	// The error stops the read in the middle of the array, and the rest of the document is still read.
+	assert_eq!(
+		soml::from_str::<Config>("a: [1, 'x', 3]\nb: 2").expect("read"),
+		Config {
+			a: Vec::new(),
+			b: 2
+		}
+	);
+
+	for text in [
+		"a: [1, 'x', 3 4]\nb: 2",
+		"a: [1, 'x', 3]\nb: 2 3",
+		"a: [1, 'x', 3]\nb: 2\na: []",
+	] {
+		assert_eq!(
+			soml::from_str::<Config>(text)
+				.expect_err("invalid")
+				.to_string(),
+			soml::from_str::<Value>(text)
+				.expect_err("invalid")
+				.to_string(),
+			"{text:?}"
+		);
+	}
+}
+
+#[test]
+fn a_type_that_asks_for_more_after_the_end_or_reads_nothing_still_gets_the_syntax_error() {
+	/**
+	Asks for the next item again after the end, which serde allows.
+	*/
+	#[derive(Debug)]
+	struct Again;
+
+	impl<'de> Deserialize<'de> for Again {
+		fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+			struct Visitor;
+
+			impl<'de> serde::de::Visitor<'de> for Visitor {
+				type Value = Again;
+
+				fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+					formatter.write_str("an array or an object")
+				}
+
+				fn visit_seq<A: serde::de::SeqAccess<'de>>(
+					self,
+					mut sequence: A,
+				) -> Result<Again, A::Error> {
+					while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+					assert!(sequence.next_element::<serde::de::IgnoredAny>()?.is_none());
+					Ok(Again)
+				}
+
+				fn visit_map<A: serde::de::MapAccess<'de>>(
+					self,
+					mut map: A,
+				) -> Result<Again, A::Error> {
+					while map.next_entry::<serde::de::IgnoredAny, Again>()?.is_some() {}
+					assert!(map.next_key::<serde::de::IgnoredAny>()?.is_none());
+					Ok(Again)
+				}
+			}
+
+			deserializer.deserialize_any(Visitor)
+		}
+	}
+
+	fn nothing<'de, D: serde::Deserializer<'de>>(_deserializer: D) -> Result<u32, D::Error> {
+		Ok(0)
+	}
+
+	#[derive(Deserialize, Debug)]
+	#[allow(dead_code, reason = "Only the error is checked.")]
+	struct Config {
+		#[serde(deserialize_with = "nothing")]
+		a: u32,
+		b: u32,
+	}
+
+	for text in ["a: {b: [1]}}", "[[]]]", "a: {}\nb: [[1]]]"] {
+		assert_eq!(
+			soml::from_str::<Again>(text)
+				.expect_err("invalid")
+				.to_string(),
+			soml::from_str::<Value>(text)
+				.expect_err("invalid")
+				.to_string(),
+			"{text:?}"
+		);
+	}
+
+	for text in ["{a: , b: 1}", "{b: 1, a: }"] {
+		assert_eq!(
+			soml::from_str::<Config>(text)
+				.expect_err("invalid")
+				.to_string(),
+			soml::from_str::<Value>(text)
+				.expect_err("invalid")
+				.to_string(),
+			"{text:?}"
+		);
+	}
+}
+
+#[test]
+fn a_type_that_catches_an_error_and_keeps_reading_gets_what_the_tree_gives() {
+	/**
+	Keeps the items that are ints, and skips the rest by catching the error.
+	*/
+	#[derive(Debug, PartialEq)]
+	struct Ints(Vec<i64>);
+
+	impl<'de> Deserialize<'de> for Ints {
+		fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+			struct Visitor;
+
+			impl<'de> serde::de::Visitor<'de> for Visitor {
+				type Value = Ints;
+
+				fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+					formatter.write_str("an array or an object")
+				}
+
+				fn visit_seq<A: serde::de::SeqAccess<'de>>(
+					self,
+					mut sequence: A,
+				) -> Result<Ints, A::Error> {
+					let mut ints = Vec::new();
+
+					loop {
+						match sequence.next_element::<i64>() {
+							Ok(Some(int)) => ints.push(int),
+							Ok(None) => return Ok(Ints(ints)),
+							Err(_) => {}
+						}
+					}
+				}
+
+				fn visit_map<A: serde::de::MapAccess<'de>>(
+					self,
+					mut map: A,
+				) -> Result<Ints, A::Error> {
+					let mut ints = Vec::new();
+
+					loop {
+						match map.next_key::<u32>() {
+							Ok(Some(_)) => ints.push(map.next_value()?),
+							Ok(None) => return Ok(Ints(ints)),
+							Err(_) => {}
+						}
+					}
+				}
+			}
+
+			deserializer.deserialize_any(Visitor)
+		}
+	}
+
+	#[derive(Deserialize, Debug, PartialEq)]
+	struct Config {
+		a: Ints,
+	}
+
+	assert_eq!(
+		soml::from_str::<Config>("a: [1, 'x', 3]").expect("read"),
+		Config {
+			a: Ints(vec![1, 3])
+		}
+	);
+	assert_eq!(
+		soml::from_str::<Ints>("{1: 10, x: 5, 2: 20}").expect("read"),
+		Ints(vec![10, 20])
+	);
+	assert_eq!(
+		soml::from_str::<Ints>("a: 1\na: 2")
+			.expect_err("invalid")
+			.to_string(),
+		soml::from_str::<Value>("a: 1\na: 2")
+			.expect_err("invalid")
+			.to_string()
+	);
 }

@@ -1,8 +1,8 @@
 /*!
 The language-neutral conformance suite in `tests/conformance`, a copy of the suite in the [`soml` spec repository](https://github.com/soml-lang/soml/tree/main/conformance). To update it, check out that repository next to this one and run `../soml/sync-conformance.sh tests/conformance`.
 
-- `valid/**/name.soml` must parse to the tagged value in `name.json`, serialize with `to_string_canonical` to exactly `name.canonical.soml`, and format to exactly `name.formatted.soml`.
-- `invalid/**/name.soml` must be rejected for the reason, and at the line and column, in `invalid-reasons.json`.
+- `valid/**/name.soml` must parse to the tagged value in `name.json`, also be accepted when every value is skipped, serialize with `to_string_canonical` to exactly `name.canonical.soml`, and format to exactly `name.formatted.soml`.
+- `invalid/**/name.soml` must be rejected for the reason, and at the line and column, in `invalid-reasons.json`, also when every value is skipped.
 - `edit/name.json` holds a formatted `document`, a `path`, a tagged `value`, which is left out for a removal, and the `expected` document after the change, which `Document::set` or `Document::remove` must give exactly, or `error: true` when the change must fail because its path does not fit the document.
 
 Every case runs, and the test reports every failure at once.
@@ -154,6 +154,12 @@ fn valid_cases_read_to_their_value_and_write_their_canonical_form() {
 			continue;
 		}
 
+		// A type that skips every value must still check the whole document.
+		if let Err(error) = soml::from_slice::<serde::de::IgnoredAny>(&bytes) {
+			failures.push(format!("{name}: rejected when skipped: {error}"));
+			continue;
+		}
+
 		match soml::to_string_canonical(&value) {
 			Ok(written) if written == canonical => {}
 			Ok(written) => {
@@ -260,6 +266,17 @@ fn invalid_cases_are_rejected_where_the_reference_rejects_them() {
 			}
 			Err(error) => error,
 		};
+
+		// A type that skips every value must get the same error.
+		match soml::from_slice::<serde::de::IgnoredAny>(&bytes) {
+			Ok(_) => failures.push(format!("{name}: accepted when skipped")),
+			Err(skipped) if skipped.to_string() != error.to_string() => {
+				failures.push(format!(
+					"{name}: {skipped} when skipped, but {error} when read"
+				));
+			}
+			Err(_) => {}
+		}
 
 		let reason = reasons
 			.get(&name)

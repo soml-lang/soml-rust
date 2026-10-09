@@ -273,6 +273,7 @@ macro_rules! from_integer {
 	};
 }
 
+// Only the types that always fit an `i64`. A `u64`, an `i128`, or a `usize` can be too large, and `From` cannot fail.
 from_integer!(i8, i16, i32, i64, u8, u16, u32);
 
 impl From<f64> for Value {
@@ -358,6 +359,33 @@ impl<K: Into<String>, V: Into<Self>> FromIterator<(K, V)> for Value {
 				.map(|(key, value)| (key.into(), value.into()))
 				.collect(),
 		)
+	}
+}
+
+/**
+Reads an instant or a duration from its text, through a newtype struct named by its token, which the SOML deserializer gives only for a value of that type, and from a string for other formats.
+*/
+pub(crate) struct TextVisitor<T> {
+	/**
+	The type, with an article, for error messages: `an instant`.
+	*/
+	pub expecting: &'static str,
+	pub parse: fn(&str) -> Result<T, String>,
+}
+
+impl<'de, T> Visitor<'de> for TextVisitor<T> {
+	type Value = T;
+
+	fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.expecting)
+	}
+
+	fn visit_str<E: de::Error>(self, text: &str) -> Result<T, E> {
+		(self.parse)(text).map_err(E::custom)
+	}
+
+	fn visit_newtype_struct<D: Deserializer<'de>>(self, deserializer: D) -> Result<T, D::Error> {
+		deserializer.deserialize_str(self)
 	}
 }
 
@@ -467,10 +495,12 @@ impl<'de> Visitor<'de> for ValueVisitor {
 		self,
 		deserializer: D,
 	) -> Result<Value, D::Error> {
+		// `Value::deserialize` asks for a newtype struct named `TOKEN`. A format that does not know the token, such as JSON, calls this with its own deserializer, so the value is read as any other value.
 		deserializer.deserialize_any(self)
 	}
 
 	fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Value, A::Error> {
+		// The size hint of another format can come from its input, so it is capped to keep a false hint from allocating much memory.
 		let mut items = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(4096));
 
 		while let Some(item) = sequence.next_element()? {
@@ -488,6 +518,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
 				Entry::Vacant(entry) => {
 					entry.insert(map.next_value()?);
 				}
+				// Another format, such as JSON, can give a key twice. SOML treats a duplicate key as an error, so a `Value` does not keep the last one.
 				Entry::Occupied(entry) => {
 					return Err(de::Error::custom(format!(
 						"Duplicate key “{}”",

@@ -206,6 +206,20 @@ proptest! {
 	}
 
 	#[test]
+	fn a_float_reads_into_f32_as_its_text_rounded_once(bits in 1..0x7F7F_FFFFu32, is_negative in any::<bool>(), digits in 0..70usize) {
+		// The halfway point between two f32 values is exact in an f64, and its digits, cut at some length, lie on either side of it, where rounding through an f64 can go the wrong way.
+		let low = f32::from_bits(bits);
+		let high = f32::from_bits(bits + 1);
+		let middle = f64::midpoint(f64::from(low), f64::from(high));
+		let middle = if is_negative { -middle } else { middle };
+		let text = format!("{middle:.digits$e}");
+		let expected: f32 = text.parse().expect("a float");
+
+		let read_back: Vec<f32> = soml::from_str(&format!("[{text}]")).map_err(|error| TestCaseError::fail(format!("{text}: {error}")))?;
+		prop_assert_eq!(read_back[0].to_bits(), expected.to_bits(), "{}", text);
+	}
+
+	#[test]
 	fn a_respelled_document_has_the_same_canonical_form(value in document(), seed in any::<u64>()) {
 		let canonical = write(&value)?;
 		let respelled = Respeller { state: seed }.document(&value);

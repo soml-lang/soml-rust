@@ -1,29 +1,29 @@
 /*!
-Writes a value as text, by the rules of canonical form: every member and item is on its own line, so a line break separates them, and no commas are written. Canonical form, the one text the spec defines for a value, so that equal values give equal bytes, also sorts the members of every object by key. Without it, members keep the order they were given, which is the order a person reading the file expects, and every other rule still holds.
+Writes a value as text, by the rules of canonical form: every member and item is on its own line, so a line break separates them, and no commas are written. Canonical form, the one text the spec defines for a value, so that equal values give equal bytes, also sorts the members of every object by key, which `Node::sort_members` does before the value is written. Without it, members keep the order they were given, which is the order a person reading the file expects, and every other rule still holds.
 */
 
 use crate::Error;
-use crate::parse::{Kind, MAX_DEPTH, Member, Node, Object};
+use crate::parse::{Kind, Node};
 use crate::scalar::is_bare_key;
-use std::borrow::Cow;
 use std::fmt::{self, Write};
 
 /**
-Writes a document, in canonical form when `canonical` is true. The value must be an array or an object.
+Writes a document. The value must be an array or an object, and the serializer must have accepted it, which checks everything else that SOML cannot represent.
 */
-pub(crate) fn document(value: &Node<'_>, canonical: bool) -> Result<String, Error> {
+pub(crate) fn document(value: &Node<'_>) -> Result<String, Error> {
 	let mut output = String::new();
 
 	match &value.kind {
 		Kind::Object(object) if !object.members.is_empty() => {
 			// A non-empty top-level object is written without braces, with its members at column 0.
-			for (key, member) in members(object, canonical) {
-				write_member(&mut output, key, &member.value, 0, 1, canonical)?;
+			for (key, member) in &object.members {
+				write_member(&mut output, key, &member.value, 0);
 				output.push('\n');
 			}
 		}
+		// An empty object keeps its braces, because an empty document is not valid.
 		Kind::Object(_) | Kind::Array(_) => {
-			write_value(&mut output, value, 0, 0, canonical)?;
+			write_value(&mut output, value, 0);
 			output.push('\n');
 		}
 		kind => {
@@ -37,132 +37,118 @@ pub(crate) fn document(value: &Node<'_>, canonical: bool) -> Result<String, Erro
 	Ok(output)
 }
 
-/**
-The members of an object in the order they were given, or sorted by key for canonical form.
-*/
-fn members<'a, 'de>(
-	object: &'a Object<'de>,
-	canonical: bool,
-) -> Vec<&'a (Cow<'de, str>, Member<'de>)> {
-	let mut members: Vec<_> = object.members.iter().collect();
-
-	if canonical {
-		// A `str` compares byte by byte, which for UTF-8 is the order of Unicode scalar values, as canonical form requires. Keys are unique, so the sort does not need to be stable.
-		members.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-	}
-
-	members
-}
-
-fn write_member(
-	output: &mut String,
-	key: &str,
-	value: &Node<'_>,
-	indentation: usize,
-	depth: usize,
-	canonical: bool,
-) -> Result<(), Error> {
-	check_representable(key, "key")?;
+fn write_member(output: &mut String, key: &str, value: &Node<'_>, indentation: usize) {
 	write_key(output, key).expect("writing to a String does not fail");
 	output.push_str(": ");
-	write_value(output, value, indentation, depth, canonical)
+	write_value(output, value, indentation);
 }
 
 /**
-Writes a value as it appears after a key or as an array item, with `indentation` tabs for the lines inside it. `depth` is the number of collections around it.
+Writes a value as it appears after a key or as an array item, with `indentation` tabs for the lines inside it.
 */
-pub(crate) fn write_value(
-	output: &mut String,
-	value: &Node<'_>,
-	indentation: usize,
-	depth: usize,
-	canonical: bool,
-) -> Result<(), Error> {
+pub(crate) fn write_value(output: &mut String, value: &Node<'_>, indentation: usize) {
 	match &value.kind {
 		Kind::Null => output.push_str("null"),
 		Kind::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-		Kind::Int(value) => write!(output, "{value}").expect("writing to a String does not fail"),
-		Kind::Float(value) => write_float(output, *value)?,
+		Kind::Int(value) => write_int(output, *value),
+		Kind::Float(value) => write_float(output, *value),
 		Kind::String(value) => {
-			check_representable(value, "string")?;
 			write_string(output, value).expect("writing to a String does not fail");
 		}
-		Kind::Instant(value) => {
-			write!(output, "{value}").expect("writing to a String does not fail")
-		}
-		Kind::Duration(value) => {
-			write!(output, "{value}").expect("writing to a String does not fail")
-		}
+		Kind::Instant(value) => write_display(output, value),
+		Kind::Duration(value) => write_display(output, value),
 		Kind::Array(items) => {
-			check_depth(depth + 1)?;
-
 			if items.is_empty() {
 				output.push_str("[]");
-				return Ok(());
+				return;
 			}
 
-			output.push_str("[\n");
+			output.push('[');
 
 			for item in items {
-				push_tabs(output, indentation + 1);
-				write_value(output, item, indentation + 1, depth + 1, canonical)?;
-				output.push('\n');
+				push_line(output, indentation + 1);
+				write_value(output, item, indentation + 1);
 			}
 
-			push_tabs(output, indentation);
+			push_line(output, indentation);
 			output.push(']');
 		}
 		Kind::Object(object) => {
-			check_depth(depth + 1)?;
-
 			if object.members.is_empty() {
 				output.push_str("{}");
-				return Ok(());
+				return;
 			}
 
-			output.push_str("{\n");
+			output.push('{');
 
-			for (key, member) in members(object, canonical) {
-				push_tabs(output, indentation + 1);
-				write_member(
-					output,
-					key,
-					&member.value,
-					indentation + 1,
-					depth + 1,
-					canonical,
-				)?;
-				output.push('\n');
+			for (key, member) in &object.members {
+				push_line(output, indentation + 1);
+				write_member(output, key, &member.value, indentation + 1);
 			}
 
-			push_tabs(output, indentation);
+			push_line(output, indentation);
 			output.push('}');
 		}
 	}
-
-	Ok(())
 }
 
-fn push_tabs(output: &mut String, count: usize) {
-	// Enough for all but the deepest nesting, so indentation is nearly always one copy.
-	const TABS: &str = "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
-	output.push_str(&TABS[..count.min(TABS.len())]);
-	output.extend(std::iter::repeat_n('\t', count.saturating_sub(TABS.len())));
-}
+/**
+Writes a line feed and `count` tabs, the start of a new line at that indentation.
+*/
+pub(crate) fn push_line(output: &mut String, count: usize) {
+	// Most lines are indented a few tabs, and single pushes, which are inlined, are faster than a copy then.
+	if count <= 4 {
+		output.push('\n');
 
-fn check_depth(depth: usize) -> Result<(), Error> {
-	if depth > MAX_DEPTH {
-		return Err(too_deep());
+		for _ in 0..count {
+			output.push('\t');
+		}
+
+		return;
 	}
 
-	Ok(())
+	// Enough for all but the deepest nesting, so indentation is nearly always one copy.
+	const LINE: &str = "\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
+	const TAB_COUNT: usize = LINE.len() - 1;
+	output.push_str(&LINE[..=count.min(TAB_COUNT)]);
+
+	if count > TAB_COUNT {
+		output.extend(std::iter::repeat_n('\t', count - TAB_COUNT));
+	}
 }
 
-#[cold]
-pub(crate) fn too_deep() -> Error {
-	Error::write(format!(
-		"The value is nested more than {MAX_DEPTH} levels deep, so no reader would accept the document"
-	))
+/**
+Writes an int in decimal, without the formatting machinery, which is several times slower for this.
+*/
+pub(crate) fn write_int(output: &mut String, value: i64) {
+	if value < 0 {
+		output.push('-');
+	}
+
+	output.push_str(decimal(value.unsigned_abs(), &mut [0; 20]));
+}
+
+/**
+The decimal digits of `value`, put at the end of `digits`, which holds the 20 digits of the largest `u64`.
+*/
+pub(crate) fn decimal(mut value: u64, digits: &mut [u8; 20]) -> &str {
+	let mut start = digits.len();
+
+	loop {
+		start -= 1;
+		digits[start] = b'0' + (value % 10) as u8;
+		value /= 10;
+
+		if value == 0 {
+			break;
+		}
+	}
+
+	std::str::from_utf8(&digits[start..]).expect("the digits are ASCII")
+}
+
+pub(crate) fn write_display(output: &mut String, value: &(impl fmt::Display + ?Sized)) {
+	write!(output, "{value}").expect("writing to a String does not fail");
 }
 
 /**
@@ -193,8 +179,21 @@ pub(crate) fn write_key(output: &mut impl Write, key: &str) -> fmt::Result {
 Whether a string needs `"..."`: it has a `'`, a tab, a line feed, another C0 control, or U+007F.
 */
 pub(crate) fn needs_escapes(text: &str) -> bool {
-	text.bytes()
-		.any(|byte| byte == b'\'' || byte < 0x20 || byte == 0x7F)
+	const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+	const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+
+	// Whether a byte of the word is zero. A borrow can only start at a zero byte, so it never makes a word without one look like it has one.
+	let has_zero = |word: u64| word.wrapping_sub(ONES) & !word & HIGHS != 0;
+	let needs = |byte: u8| byte == b'\'' || byte < 0x20 || byte == 0x7F;
+	let (words, remainder) = text.as_bytes().as_chunks::<8>();
+
+	// It checks 8 bytes at a time, as `scalar::find_any` does. A byte below 0x20 is the one that the subtraction of 0x20 takes below zero.
+	words.iter().any(|word| {
+		let word = u64::from_ne_bytes(*word);
+		word.wrapping_sub(ONES * 0x20) & !word & HIGHS != 0
+			|| has_zero(word ^ (ONES * u64::from(b'\'')))
+			|| has_zero(word ^ (ONES * 0x7F))
+	}) || remainder.iter().any(|&byte| needs(byte))
 }
 
 /**
@@ -207,15 +206,34 @@ pub(crate) fn write_string(output: &mut impl Write, text: &str) -> fmt::Result {
 		return output.write_char('\'');
 	}
 
+	write_escaped_string(output, text)
+}
+
+/**
+Writes a string that `needs_escapes` accepts as `'...'`.
+*/
+pub(crate) fn write_literal_string(output: &mut String, text: &str) {
+	output.reserve(text.len() + 2);
+	output.push('\'');
+	output.push_str(text);
+	output.push('\'');
+}
+
+/**
+Writes a string as `"..."` with escapes.
+*/
+pub(crate) fn write_escaped_string(output: &mut impl Write, text: &str) -> fmt::Result {
 	output.write_char('"')?;
 	let mut chunk_start = 0;
 
+	// Every byte that is escaped is ASCII, so `index` is always at a character boundary.
 	for (index, byte) in text.bytes().enumerate() {
 		let escape = match byte {
 			b'\\' => "\\\\",
 			b'"' => "\\\"",
 			b'\n' => "\\n",
 			b'\t' => "\\t",
+			// No short escape, so it is written as `\u{…}` below.
 			0x00..0x20 | 0x7F => "",
 			_ => continue,
 		};
@@ -238,22 +256,20 @@ pub(crate) fn write_string(output: &mut impl Write, text: &str) -> fmt::Result {
 /**
 Writes a float in canonical form (spec rule 11): the shortest digits that read back as the same value, laid out like ECMAScript's `Number::toString`, with `.0` when it would otherwise read as an int.
 
-The digits come from `zmij`, because when two shortest digit strings are equally close to the value, the spec requires the even one, and `std` picks the higher one. The layout is written here, because it is part of the spec, and a dependency's own layout can change.
+The digits come from `zmij`, because when two shortest digit strings are equally close to the value, the spec requires the even one, and `std` picks the higher one. The layout is written here, because it is part of the spec, and a dependency's own layout can change. zmij's own text is used only where it has no exponent, and a test checks that it is the same layout there.
 */
-pub(crate) fn write_float(output: &mut String, value: f64) -> Result<(), Error> {
-	if value.is_nan() {
-		return Err(Error::write("NaN is not a SOML value"));
-	}
+pub(crate) fn write_float(output: &mut String, value: f64) {
+	debug_assert!(!value.is_nan(), "the serializer rejects NaN");
 
 	if value.is_infinite() {
 		output.push_str(if value > 0.0 { "infinity" } else { "-infinity" });
-		return Ok(());
+		return;
 	}
 
 	// Zero has one value whatever its sign.
 	if value == 0.0 {
 		output.push_str("0.0");
-		return Ok(());
+		return;
 	}
 
 	if value < 0.0 {
@@ -261,8 +277,23 @@ pub(crate) fn write_float(output: &mut String, value: f64) -> Result<(), Error> 
 	}
 
 	let mut buffer = zmij::Buffer::new();
+	let text = buffer.format_finite(value.abs());
+
+	// zmij writes no exponent only from about 1e-5 to 1e16, where canonical form has the same text, such as `61.171`, `0.5`, or `180.0`. An exponent is at most `e-324`, so its `e` is in the last 5 bytes, and a loop over them is faster than a search of short text.
+	if !text.bytes().rev().take(5).any(|byte| byte == b'e') {
+		output.push_str(text);
+		return;
+	}
+
+	write_layout(output, text);
+}
+
+/**
+Writes the digits of zmij's `text` for a positive float in the layout of canonical form.
+*/
+fn write_layout(output: &mut String, text: &str) {
 	let mut digit_buffer = [0; 32];
-	let (digits, exponent) = shortest_digits(buffer.format_finite(value.abs()), &mut digit_buffer);
+	let (digits, exponent) = shortest_digits(text, &mut digit_buffer);
 	// The value is 0.d₁d₂…dₖ × 10ⁿ.
 	let count = digits.len() as i32;
 	let point = exponent + count;
@@ -289,8 +320,6 @@ pub(crate) fn write_float(output: &mut String, value: f64) -> Result<(), Error> 
 
 		write!(output, "e{}", point - 1).expect("writing to a String does not fail");
 	}
-
-	Ok(())
 }
 
 /**
@@ -331,4 +360,76 @@ fn shortest_digits<'a>(text: &str, buffer: &'a mut [u8; 32]) -> (&'a str, i32) {
 		std::str::from_utf8(&buffer[..significant]).expect("the digits are ASCII"),
 		exponent,
 	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn needs_escapes_finds_each_byte_at_each_place_in_a_word() {
+		// Every ASCII byte at every place of a string of up to 2 words, between plain letters or between bytes of `é`, which are 0x80 and above.
+		for filler in ["a", "é"] {
+			for length in 1..=17 {
+				for place in 0..length {
+					for byte in 0..=0x7F_u8 {
+						let mut text: Vec<u8> = filler.repeat(length).into_bytes();
+						let place = place * filler.len();
+						text[place] = byte;
+
+						// Replacing a byte of `é` leaves invalid UTF-8, so the other byte becomes a letter too.
+						if filler.len() == 2 {
+							text[place ^ 1] = b'a';
+						}
+
+						let text = String::from_utf8(text).expect("valid UTF-8");
+						let expected = byte == b'\'' || byte < 0x20 || byte == 0x7F;
+						assert_eq!(needs_escapes(&text), expected, "{text:?}");
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn the_text_of_zmij_without_an_exponent_is_in_canonical_layout() {
+		// Every power of ten and the floats next to it cover the edges of zmij's range. A simple generator adds short decimals, such as `61.171`, and floats with all their digits, at every power of ten in between.
+		let powers = (-30..=30).flat_map(|exponent| {
+			let value = 10_f64.powi(exponent);
+			[value.next_down(), value, value.next_up()]
+		});
+		let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+		let others = std::iter::repeat_with(move || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			let power = 10_f64.powi((state % 30) as i32 - 10);
+
+			if state & (1 << 40) == 0 {
+				((state >> 20) % 1_000_000) as f64 * power
+			} else {
+				(state >> 11) as f64 / (1_u64 << 53) as f64 * power
+			}
+		});
+		let mut compared = 0;
+
+		for value in powers
+			.chain(others.take(1_000_000))
+			.filter(|value| *value > 0.0)
+		{
+			let mut buffer = zmij::Buffer::new();
+			let text = buffer.format_finite(value);
+
+			if text.contains('e') {
+				continue;
+			}
+
+			let mut expected = String::new();
+			write_layout(&mut expected, text);
+			assert_eq!(text, expected, "{value:e}");
+			compared += 1;
+		}
+
+		assert!(compared > 500_000, "{compared}");
+	}
 }

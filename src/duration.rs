@@ -1,5 +1,5 @@
 use crate::Error;
-use serde_core::de::{self, Deserialize, Deserializer, Visitor};
+use serde_core::de::{Deserialize, Deserializer};
 use serde_core::ser::{Serialize, Serializer};
 use std::fmt::{self, Display};
 use std::str::FromStr;
@@ -230,6 +230,7 @@ impl Duration {
 			);
 		}
 
+		// The limit check keeps the signed result in the `i64` range, but `total` can be 2⁶³, the magnitude of `i64::MIN`, which an `i64` cannot hold.
 		let magnitude = total as i128;
 		Ok(Self::from_nanoseconds(
 			(if is_negative { -magnitude } else { magnitude }) as i64,
@@ -251,11 +252,21 @@ fn integer_digits(digits: &[u8]) -> u128 {
 		})
 }
 
+/**
+Whether `unit` is a year unit in any case, such as `y` or `Years`, which a year not being a fixed length rules out.
+*/
+pub(crate) fn is_year_unit(unit: &[u8]) -> bool {
+	["y", "yr", "yrs", "year", "years"]
+		.iter()
+		.any(|name| name.as_bytes().eq_ignore_ascii_case(unit))
+}
+
 fn describe_bad_unit(unit: &str, text: &str) -> String {
 	match unit {
 		"" => "every number needs a unit: h, m, s, ms, us, or ns".to_owned(),
 		"d" | "day" | "days" => "there is no day unit, because a day is not a fixed length. Write 24h for a fixed 24 hours".to_owned(),
 		"w" | "week" | "weeks" => "there is no week unit, because a day is not a fixed length. Write 168h for a fixed 168 hours".to_owned(),
+		_ if is_year_unit(unit.as_bytes()) => "there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days".to_owned(),
 		"M" => {
 			// A number with `M` alone, as in `memory: 512M`, is more often a size than a duration, and `512m` would read as minutes.
 			let is_size = text.len() <= crate::scalar::MAX_DIAGNOSED_LENGTH && text.ends_with('M') && text[..text.len() - 1].bytes().all(|byte| byte.is_ascii_digit() || byte == b'_');
@@ -292,16 +303,21 @@ impl Display for Duration {
 		let seconds = magnitude / SECOND % 60;
 		let nanoseconds = (magnitude % SECOND) as u32;
 
+		// The digits are written without `write!`, which is several times slower, as for an instant.
+		let mut digits = [0; 20];
+
 		if hours > 0 {
-			write!(formatter, "{hours}h")?;
+			formatter.write_str(crate::write::decimal(hours, &mut digits))?;
+			formatter.write_str("h")?;
 		}
 
 		if minutes > 0 {
-			write!(formatter, "{minutes}m")?;
+			formatter.write_str(crate::write::decimal(minutes, &mut digits))?;
+			formatter.write_str("m")?;
 		}
 
 		if seconds > 0 || nanoseconds > 0 {
-			write!(formatter, "{seconds}")?;
+			formatter.write_str(crate::write::decimal(seconds, &mut digits))?;
 			crate::instant::write_fraction(formatter, nanoseconds)?;
 			formatter.write_str("s")?;
 		}
@@ -377,27 +393,12 @@ impl Serialize for Duration {
 
 impl<'de> Deserialize<'de> for Duration {
 	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-		struct DurationVisitor;
-
-		impl<'de> Visitor<'de> for DurationVisitor {
-			type Value = Duration;
-
-			fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-				formatter.write_str("a duration")
-			}
-
-			fn visit_str<E: de::Error>(self, text: &str) -> Result<Duration, E> {
-				Duration::parse(text).map_err(E::custom)
-			}
-
-			fn visit_newtype_struct<D: Deserializer<'de>>(
-				self,
-				deserializer: D,
-			) -> Result<Duration, D::Error> {
-				deserializer.deserialize_str(self)
-			}
-		}
-
-		deserializer.deserialize_newtype_struct(TOKEN, DurationVisitor)
+		deserializer.deserialize_newtype_struct(
+			TOKEN,
+			crate::value::TextVisitor {
+				expecting: "a duration",
+				parse: Self::parse,
+			},
+		)
 	}
 }

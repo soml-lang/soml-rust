@@ -2,7 +2,7 @@
 The syntax tree: lossless printing, positions, comments, and changes with `set` and `remove`.
 */
 
-use soml::tree::{CommentKind, Decor, Key, Member, Node, Radix, StringStyle};
+use soml::tree::{CommentKind, Decor, Item, Key, Member, Node, Radix, StringStyle};
 use soml::{Document, PathSegment, Value};
 use std::fs;
 use std::path::Path;
@@ -335,6 +335,164 @@ fn set_writes_a_new_collection_on_indented_lines() {
 				.expect("set")
 		},
 		"a: 1\nempty: []\n",
+	);
+}
+
+#[test]
+fn set_indents_new_lines_in_an_indented_top_level_collection_from_its_line() {
+	check(
+		"\t{}\n",
+		|document| document.set(["a"], 1).expect("set"),
+		"\t{\n\t\ta: 1\n\t}\n",
+	);
+	check(
+		"\t[]\n",
+		|document| document.set([0], [1]).expect("set"),
+		"\t[\n\t\t[\n\t\t\t1\n\t\t]\n\t]\n",
+	);
+	check(
+		"# c\n  [\n  ]\n",
+		|document| document.set([0], [1]).expect("set"),
+		"# c\n  [\n  \t[\n  \t\t1\n  \t]\n  ]\n",
+	);
+	check(
+		"\t{} # c\n",
+		|document| document.set(["a"], 1).expect("set"),
+		"\t{\n\t\ta: 1\n\t} # c\n",
+	);
+	check(
+		"\t{\n\t}\n",
+		|document| document.set(["a", "b"], 1).expect("set"),
+		"\t{\n\t\ta: {\n\t\t\tb: 1\n\t\t}\n\t}\n",
+	);
+	check(
+		"\t{a: 1\n\t}\n",
+		|document| {
+			document
+				.set(["b"], Value::from_iter([("x", 1)]))
+				.expect("set")
+		},
+		"\t{a: 1\n\tb: {\n\t\tx: 1\n\t}\n\t}\n",
+	);
+	check(
+		"\t{a: {}\n\t}\n",
+		|document| {
+			document
+				.set(["a", "b"], Value::from_iter([("x", 1)]))
+				.expect("set")
+		},
+		"\t{a: {\n\t\tb: {\n\t\t\tx: 1\n\t\t}\n\t}\n\t}\n",
+	);
+	// A block comment before the collection on its line is not indentation.
+	check(
+		"/* c */ {}\n",
+		|document| document.set(["a"], 1).expect("set"),
+		"/* c */ {\n\ta: 1\n}\n",
+	);
+	// A top-level object without braces has no line of its own, and an indented collection on one line stays on one line.
+	check(
+		"\ta: 1\n",
+		|document| document.set(["b"], [1]).expect("set"),
+		"\ta: 1\n\tb: [\n\t\t1\n\t]\n",
+	);
+	check(
+		"\t{a: 1}\n",
+		|document| document.set(["b"], [1]).expect("set"),
+		"\t{a: 1, b: [1]}\n",
+	);
+}
+
+#[test]
+fn changes_in_an_indented_top_level_collection_keep_its_indentation() {
+	check(
+		"\t{\n\t\ta: 1\n\t\tb: 2\n\t}\n",
+		|document| assert!(document.remove(["b"]).expect("remove")),
+		"\t{\n\t\ta: 1\n\t}\n",
+	);
+	check(
+		"\t{\n\t\ta: 1\n\t}\n",
+		|document| assert!(document.remove(["a"]).expect("remove")),
+		"\t{}\n",
+	);
+	check(
+		"  [\n  ]\n",
+		|document| {
+			document
+				.set([0], Value::from_iter([("x", [1])]))
+				.expect("set")
+		},
+		"  [\n  \t{\n  \t\tx: [\n  \t\t\t1\n  \t\t]\n  \t}\n  ]\n",
+	);
+	check(
+		"\t{\n\t\ta: {\n\t\t\tb: 1\n\t\t}\n\t}\n",
+		|document| document.set(["a", "c"], [1]).expect("set"),
+		"\t{\n\t\ta: {\n\t\t\tb: 1\n\t\t\tc: [\n\t\t\t\t1\n\t\t\t]\n\t\t}\n\t}\n",
+	);
+	// A value that replaces a block string goes on the key's line, at the indentation of that line.
+	check(
+		"\t{\n\t\ta:\n\t\t\t\'\'\'\n\t\t\tx\n\t\t\t\'\'\'\n\t}\n",
+		|document| document.set(["a"], [1]).expect("set"),
+		"\t{\n\t\ta: [\n\t\t\t1\n\t\t]\n\t}\n",
+	);
+}
+
+#[test]
+fn the_tree_constructors_refuse_what_cannot_be_written() {
+	for (value, message) in [
+		(Value::Float(f64::NAN), "NaN is not a SOML value"),
+		(
+			Value::from("a\rb"),
+			"A string cannot contain a carriage return (U+000D), because SOML cannot represent one",
+		),
+		(
+			Value::from_iter([("a\rb", 1)]),
+			"A key cannot contain a carriage return (U+000D), because SOML cannot represent one",
+		),
+		(
+			Value::from([Value::from_iter([("x", f64::NAN)])]),
+			"NaN is not a SOML value",
+		),
+	] {
+		assert_eq!(
+			Node::new(value.clone())
+				.expect_err("cannot be written")
+				.message(),
+			message
+		);
+		assert_eq!(
+			Item::new(value.clone())
+				.expect_err("cannot be written")
+				.message(),
+			message
+		);
+		assert_eq!(
+			Member::new(Key::new("k"), value)
+				.expect_err("cannot be written")
+				.message(),
+			message
+		);
+	}
+
+	// An instant, a duration, and negative zero are written as they are.
+	let instant = soml::Instant::from_unix(-1, 5).expect("in range");
+	let mut document = document("a: 1\n");
+	let members = document
+		.root_mut()
+		.as_object_mut()
+		.expect("an object")
+		.members_mut();
+	*members[0].value_mut() = Node::new(instant).expect("valid");
+	members.push(
+		Member::new(
+			Key::new("b"),
+			soml::Duration::from_nanoseconds(-1_500_000_000),
+		)
+		.expect("valid"),
+	);
+	members.push(Member::new(Key::new("c"), -0.0).expect("valid"));
+	assert_eq!(
+		document.to_string(),
+		"a: 1969-12-31T23:59:59.000000005Z\nb: -1.5s\nc: 0.0"
 	);
 }
 
@@ -929,6 +1087,98 @@ fn node_level_changes_print_and_are_checked_by_to_value() {
 		document.to_value().unwrap_err().message(),
 		"Duplicate key a"
 	);
+}
+
+#[test]
+fn set_after_an_entry_pushed_before_a_closing_line_break_adds_on_a_new_line() {
+	// A pushed entry has no decor, so the line break after it is in the closing decor, not in its trailing decor as the parser puts it.
+	let mut changed = document("ports: [\n\t# none yet\n]\n");
+	changed
+		.get_mut(["ports"])
+		.and_then(Node::as_array_mut)
+		.expect("an array")
+		.items_mut()
+		.push(Item::new(80).expect("an item"));
+	assert_eq!(changed.to_string(), "ports: [80\n\t# none yet\n]\n");
+	changed
+		.set([PathSegment::from("ports"), 1.into()], 443)
+		.expect("set");
+	assert_eq!(changed.to_string(), "ports: [80\n443\n\t# none yet\n]\n");
+	assert_eq!(
+		changed.to_value().expect("valid").get("ports"),
+		Some(&Value::from([80, 443]))
+	);
+
+	let mut changed = document("deps: {\n}\n");
+	changed
+		.get_mut(["deps"])
+		.and_then(Node::as_object_mut)
+		.expect("an object")
+		.members_mut()
+		.push(Member::new(Key::new("a"), 1).expect("a member"));
+	changed.set(["deps", "b"], 2).expect("set");
+	assert_eq!(changed.to_string(), "deps: {a: 1\nb: 2\n}\n");
+
+	// Spaces before the line break stay at the end of the line they are on.
+	let mut changed = document("[\n]");
+	changed
+		.root_mut()
+		.as_array_mut()
+		.expect("an array")
+		.items_mut()
+		.push(Item::new(1).expect("an item"));
+	*changed
+		.root_mut()
+		.as_array_mut()
+		.expect("an array")
+		.closing_decor_mut() = " \t\n".to_owned();
+	changed.set([1], 2).expect("set");
+	assert_eq!(changed.to_string(), "[1 \t\n2\n]");
+
+	// A comment before that line break stays with the entry, as when the text is parsed, and the new entry goes on the next line.
+	let mut changed = document("[\n]");
+	let array = changed.root_mut().as_array_mut().expect("an array");
+	array.items_mut().push(Item::new(1).expect("an item"));
+	*array.closing_decor_mut() = " /* c */ # d\n".to_owned();
+	changed.set([1], 2).expect("set");
+	assert_eq!(changed.to_string(), "[1 /* c */ # d\n2\n]");
+	let mut parsed = document("[1 /* c */ # d\n]");
+	parsed.set([1], 2).expect("set");
+	assert_eq!(parsed.to_string(), changed.to_string());
+}
+
+/**
+`text` with `items` pushed onto its `ports` array, which gives them no decor.
+*/
+fn pushed(text: &str, items: &[i64]) -> Document {
+	let mut changed = document(text);
+	let array = changed
+		.get_mut(["ports"])
+		.and_then(Node::as_array_mut)
+		.expect("an array");
+
+	for item in items {
+		array.items_mut().push(Item::new(*item).expect("an item"));
+	}
+
+	changed
+}
+
+#[test]
+fn remove_after_an_entry_pushed_before_a_closing_line_break_keeps_the_comment_lines() {
+	for (items, index, after) in [
+		(&[80][..], 0, "ports: [\n\t# none yet\n]\n"),
+		(&[80, 443][..], 1, "ports: [80\n\t# none yet\n]\n"),
+		(&[80, 443][..], 0, "ports: [443\n\t# none yet\n]\n"),
+	] {
+		let mut changed = pushed("ports: [\n\t# none yet\n]\n", items);
+		let mut parsed = document(&changed.to_string());
+		let path = [PathSegment::from("ports"), index.into()];
+		assert!(changed.remove(path).expect("remove"));
+		assert!(parsed.remove(path).expect("remove"));
+		assert_eq!(changed.to_string(), after);
+		assert_eq!(parsed.to_string(), after);
+	}
 }
 
 #[test]

@@ -527,6 +527,18 @@ fn a_code_frame_shows_up_to_two_lines_before_the_error() {
 }
 
 #[test]
+fn a_code_frame_shows_blank_lines_before_the_error() {
+	for (text, frame) in [
+		("a: 1\n\n\nd: x", "  2 |\n  3 |\n> 4 | d: x\n    |    ^"),
+		("\nd: x", "  1 |\n> 2 | d: x\n    |    ^"),
+		("\n\nd: x", "  1 |\n  2 |\n> 3 | d: x\n    |    ^"),
+	] {
+		let error = soml::from_str::<Value>(text).unwrap_err();
+		assert_eq!(error.code_frame(text).expect("a frame"), frame, "{text:?}");
+	}
+}
+
+#[test]
 fn a_code_frame_widens_its_gutter_for_large_line_numbers() {
 	let text = format!(
 		"{}z: x",
@@ -1896,4 +1908,689 @@ fn a_hint_gives_no_example_for_a_token_longer_than_the_diagnosed_length() {
 			"é".repeat(39)
 		)
 	);
+}
+
+/**
+Checks the reason, without the position, of each document that must be invalid, and reports every mismatch at once.
+*/
+fn assert_reasons(cases: &[(&str, &str)]) {
+	let mut failures = Vec::new();
+
+	for (text, expected) in cases {
+		match soml::from_str::<Value>(text) {
+			Ok(_) => failures.push(format!("{text:?} was accepted")),
+			Err(error) if error.message() == *expected => {}
+			Err(error) => failures.push(format!(
+				"{text:?}: {}, expected {expected}",
+				error.message()
+			)),
+		}
+	}
+
+	assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/**
+The value of a Unicode escape with uppercase digits is checked before its spelling, so that lowercasing the digits never gives an escape that is not allowed either.
+*/
+#[test]
+fn the_value_of_a_unicode_escape_with_uppercase_digits_is_checked_before_its_spelling() {
+	assert_reasons(&[
+		(
+			r#"a: "\u{D}""#,
+			r"A carriage return (U+000D) cannot be represented, so \u{D} is not allowed",
+		),
+		(
+			r#"a: "\u{00D}""#,
+			r"A carriage return (U+000D) cannot be represented, so \u{00D} is not allowed",
+		),
+		(
+			r#"a: "\u{D800}""#,
+			r"\u{D800} is a surrogate, which is not a Unicode scalar value",
+		),
+		(
+			r#"a: "\u{dFfF}""#,
+			r"\u{dFfF} is a surrogate, which is not a Unicode scalar value",
+		),
+		(
+			r#"a: "\u{FFFFFF}""#,
+			r"\u{FFFFFF} is above U+10FFFF, the largest Unicode scalar value",
+		),
+		(
+			r#"a: "\u{11000F}""#,
+			r"\u{11000F} is above U+10FFFF, the largest Unicode scalar value",
+		),
+		(
+			"a: \"\"\"\n\t\\u{D}\n\t\"\"\"",
+			r"A carriage return (U+000D) cannot be represented, so \u{D} is not allowed",
+		),
+		(
+			r#""\u{D}": 1"#,
+			r"A carriage return (U+000D) cannot be represented, so \u{D} is not allowed",
+		),
+		(
+			r#"a: "\u{E9}""#,
+			"A Unicode escape uses lowercase hexadecimal digits",
+		),
+		(
+			r#"a: "\u{1F600}""#,
+			"A Unicode escape uses lowercase hexadecimal digits",
+		),
+		(
+			r#"a: "\u{10FFFF}""#,
+			"A Unicode escape uses lowercase hexadecimal digits",
+		),
+		(
+			r#"a: "\u{00E9}""#,
+			"A Unicode escape uses lowercase hexadecimal digits",
+		),
+		(
+			r#"a: "\u{D7FF}""#,
+			"A Unicode escape uses lowercase hexadecimal digits",
+		),
+		(
+			r#"a: "\u{E000}""#,
+			"A Unicode escape uses lowercase hexadecimal digits",
+		),
+		(
+			r#"a: "\u{C}""#,
+			"A Unicode escape uses lowercase hexadecimal digits",
+		),
+		(
+			r#"a: "\u{FFFFFFF}""#,
+			"A Unicode escape uses lowercase hexadecimal digits",
+		),
+		(
+			r#"a: "\u{1234567}""#,
+			"A Unicode escape has at most six hexadecimal digits",
+		),
+	]);
+}
+
+/**
+An offset after a space is the offset an instant was meant in, so the instant is not a local time to quote as a string.
+*/
+#[test]
+fn an_offset_after_a_space_is_the_offset_an_instant_was_meant_in() {
+	assert_reasons(&[
+		(
+			"a: 2026-09-19T14:00:00 Z",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00Z",
+		),
+		(
+			"a: 2026-09-19T14:00:00 +02:00",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00+02:00",
+		),
+		(
+			"a: 2026-09-19T14:00:00.5 -07:30",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00.5-07:30",
+		),
+		(
+			"a: 2026-09-19T14:00:00\t\tZ # note",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00Z",
+		),
+		(
+			"a: [2026-09-19T14:00:00 Z, 1]",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00Z",
+		),
+		(
+			"a: {b: 2026-09-19T14:00:00 Z}",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00Z",
+		),
+		(
+			"a: [\n\t2026-09-19T14:00:00 Z\n]",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00Z",
+		),
+		(
+			"a: 2026-02-30T14:00:00 Z",
+			"An instant's offset follows its time directly, without a space",
+		),
+		(
+			"a: 0001-01-01T00:00:00 +00:01",
+			"An instant's offset follows its time directly, without a space",
+		),
+		(
+			"a: 2026-09-19T14:00:00 +24:00",
+			"An instant's offset follows its time directly, without a space",
+		),
+		(
+			"a: 2026-09-19T14:00:00 +02:00 # é",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00+02:00",
+		),
+		(
+			"a: 2026-09-19T14:00:00",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00:00 # Z",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00:00 Zulu",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00:00 +02:00:00",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00:00 +0200",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00:00\nZ: 1",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00 Z",
+			"Invalid instant “2026-09-19T14:00”. An instant is written as 2026-09-19T14:00:00Z, with an optional fraction of up to nine digits and an offset of Z or ±HH:MM",
+		),
+		(
+			"a: 2026-09-19T14:00:00Z Z",
+			"Expected a line break before the next entry, but found “Z”",
+		),
+		(
+			"a: 2026-09-19T14:00:00 Montréal",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00:00 é",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: [2026-09-19 😀😀]",
+			"2026-09-19 is a date, not an instant. Write a date as a string, as in '2026-09-19'. An instant needs a time and an offset, as in 2026-09-19T00:00:00Z",
+		),
+		(
+			"a: 2026-09-19 Montréal",
+			"2026-09-19 is a date, not an instant. Write a date as a string, as in '2026-09-19'. An instant needs a time and an offset, as in 2026-09-19T00:00:00Z",
+		),
+		(
+			"a: 2026-09-19T14:00 x日本",
+			"Invalid instant “2026-09-19T14:00”. An instant is written as 2026-09-19T14:00:00Z, with an optional fraction of up to nine digits and an offset of Z or ±HH:MM",
+		),
+		(
+			"a: 2026-09-19T14:00:00 Zé",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00:00 +02:0é",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 1979-05-27 07:32:00 Z",
+			"The date and time separator in an instant is an uppercase “T”, not a space, and an instant needs the offset it was meant in, as in 1979-05-27T07:32:00Z for UTC. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '1979-05-27 07:32:00'",
+		),
+	]);
+}
+
+/**
+A value with a “:” that starts with a zero, such as a MAC address, is not a number with a leading zero.
+*/
+#[test]
+fn a_value_with_a_colon_that_starts_with_a_zero_is_not_a_number_with_a_leading_zero() {
+	assert_reasons(&[
+		(
+			"mac: 00:1A:2B:3C:4D:5E",
+			"Invalid number “00:1A:2B:3C:4D:5E”. A string value must be quoted, as in '00:1A:2B:3C:4D:5E'",
+		),
+		(
+			"mac: 01:23:45:67:89:AB",
+			"Invalid number “01:23:45:67:89:AB”. A string value must be quoted, as in '01:23:45:67:89:AB'",
+		),
+		(
+			"a: 0123:abcd::1",
+			"Invalid number “0123:abcd::1”. A string value must be quoted, as in '0123:abcd::1'",
+		),
+		(
+			"a: [00:1A:2B, 1]",
+			"Invalid number “00:1A:2B”. A string value must be quoted, as in '00:1A:2B'",
+		),
+		("a: -01:30", "Invalid number “-01:30”"),
+		(
+			"a: 01",
+			"Leading zeros are not allowed in a decimal number. Write an octal number, such as a file mode, as 0o1, and an identifier, such as a ZIP code, as a string: '01'",
+		),
+		(
+			"a: 01A",
+			"Leading zeros are not allowed in a decimal number",
+		),
+		(
+			"a: 00.5",
+			"Leading zeros are not allowed in a decimal number",
+		),
+		(
+			"a: 00:11:22:33:44:55",
+			"Invalid number “00:11:22:33:44:55”. A value that contains “:” must be quoted, as in '00:11:22:33:44:55'",
+		),
+		(
+			"a: 08:30",
+			"A time of day is a string, so it must be quoted",
+		),
+		("a: 1:", "Invalid number “1:”"),
+		(
+			"a: 2001:db8::1",
+			"Invalid number “2001:db8::1”. A string value must be quoted, as in '2001:db8::1'",
+		),
+	]);
+}
+
+/**
+A duration in years is reported as one, as one in days or weeks is, and a word that only starts with a year unit is a string to quote.
+*/
+#[test]
+fn a_duration_in_years_is_reported_as_one() {
+	assert_reasons(&[
+		(
+			"a: 1y",
+			"Invalid duration 1y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1y, 1]",
+			"Invalid duration 1y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 2years",
+			"Invalid duration 2years: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [2years, 1]",
+			"Invalid duration 2years: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 1year",
+			"Invalid duration 1year: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1year, 1]",
+			"Invalid duration 1year: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 3yr",
+			"Invalid duration 3yr: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [3yr, 1]",
+			"Invalid duration 3yr: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 3yrs",
+			"Invalid duration 3yrs: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [3yrs, 1]",
+			"Invalid duration 3yrs: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 1Y",
+			"Invalid duration 1Y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1Y, 1]",
+			"Invalid duration 1Y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 1YEAR",
+			"Invalid duration 1YEAR: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1YEAR, 1]",
+			"Invalid duration 1YEAR: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 1.5y",
+			"Invalid duration 1.5y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1.5y, 1]",
+			"Invalid duration 1.5y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 1_000y",
+			"Invalid duration 1_000y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1_000y, 1]",
+			"Invalid duration 1_000y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: -1y",
+			"Invalid duration -1y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [-1y, 1]",
+			"Invalid duration -1y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 1y6m",
+			"Invalid duration 1y6m: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1y6m, 1]",
+			"Invalid duration 1y6m: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 1h1y",
+			"Invalid duration 1h1y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1h1y, 1]",
+			"Invalid duration 1h1y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 1y1y",
+			"Invalid duration 1y1y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: [1y1y, 1]",
+			"Invalid duration 1y1y: there is no year unit, because a year is not a fixed length. Write 8760h for a fixed 365 days",
+		),
+		(
+			"a: 100yen",
+			"Invalid number “100yen”. A string value must be quoted, as in '100yen'",
+		),
+		(
+			"a: 1yard",
+			"Invalid number “1yard”. A string value must be quoted, as in '1yard'",
+		),
+		(
+			"a: 5yo",
+			"Invalid number “5yo”. A string value must be quoted, as in '5yo'",
+		),
+		(
+			"a: 1yrsx",
+			"Invalid number “1yrsx”. A string value must be quoted, as in '1yrsx'",
+		),
+		(
+			"a: 1yearsx",
+			"Invalid number “1yearsx”. A string value must be quoted, as in '1yearsx'",
+		),
+		(
+			"a: 1y.5",
+			"Invalid number “1y.5”. A string value must be quoted, as in '1y.5'",
+		),
+		(
+			"a: 1 y",
+			"A unit cannot follow a number after a space. Write a duration without the space, as in 10s, and anything else, such as a size, as a string, as in '1 y'",
+		),
+	]);
+}
+
+/**
+Only a number ends with its exponent marker, so a word that ends with an “e” has no exponent.
+*/
+#[test]
+fn only_a_number_ends_with_its_exponent_marker() {
+	assert_reasons(&[
+		(
+			"a: 7zip-bin-name",
+			"Invalid number “7zip-bin-name”. A string value must be quoted, as in '7zip-bin-name'",
+		),
+		(
+			"a: 1byte",
+			"Invalid number “1byte”. A string value must be quoted, as in '1byte'",
+		),
+		(
+			"a: 3-phase",
+			"Invalid number “3-phase”. A string value must be quoted, as in '3-phase'",
+		),
+		(
+			"a: 1-time",
+			"Invalid number “1-time”. A string value must be quoted, as in '1-time'",
+		),
+		(
+			"a: [100-pre, 1]",
+			"Invalid number “100-pre”. A string value must be quoted, as in '100-pre'",
+		),
+		(
+			"a: 2e-e",
+			"Invalid number “2e-e”. A string value must be quoted, as in '2e-e'",
+		),
+		("a: -verbose", "Expected a digit or “infinity” after “-”"),
+		(
+			"args: [-recursive]",
+			"Expected a digit or “infinity” after “-”",
+		),
+		("a: 1e", "Expected digits after the exponent marker “e”"),
+		("a: 1e-", "Expected digits after the exponent marker “e”"),
+		("a: -1e", "Expected digits after the exponent marker “e”"),
+		("a: 1.5e", "Expected digits after the exponent marker “e”"),
+		("a: 1.5e-", "Expected digits after the exponent marker “e”"),
+		(
+			"a: -1_0.5_0e",
+			"Expected digits after the exponent marker “e”",
+		),
+		("a: 0e", "Expected digits after the exponent marker “e”"),
+		("a: 0.0e-", "Expected digits after the exponent marker “e”"),
+	]);
+}
+
+/**
+A word after “-” is only NaN or infinity when it is the whole word, as for one without the “-”.
+*/
+#[test]
+fn a_word_after_a_minus_is_only_nan_or_infinity_when_it_is_the_whole_word() {
+	assert_reasons(&[
+		("a: -nano", "Expected a digit or “infinity” after “-”"),
+		("a: -nanny", "Expected a digit or “infinity” after “-”"),
+		("a: -info", "Expected a digit or “infinity” after “-”"),
+		("a: -INFO", "Expected a digit or “infinity” after “-”"),
+		(
+			"args: [-inform, PEM]",
+			"Expected a digit or “infinity” after “-”",
+		),
+		("a: -infinite", "Expected a digit or “infinity” after “-”"),
+		("a: -infinityx", "Expected a digit or “infinity” after “-”"),
+		(
+			"a: nano",
+			"Unexpected “nano”. A string value must be quoted, as in 'nano'",
+		),
+		(
+			"a: info",
+			"Unexpected “info”. A string value must be quoted, as in 'info'",
+		),
+		(
+			"a: -nan",
+			"NaN is not representable. Use null for a missing value",
+		),
+		(
+			"a: -NaN",
+			"NaN is not representable. Use null for a missing value",
+		),
+		(
+			"a: -NAN",
+			"NaN is not representable. Use null for a missing value",
+		),
+		(
+			"a: -inf",
+			"“-inf” is not a value. Negative infinity is written -infinity",
+		),
+		(
+			"a: -Inf",
+			"“-Inf” is not a value. Negative infinity is written -infinity",
+		),
+		(
+			"a: -INF",
+			"“-INF” is not a value. Negative infinity is written -infinity",
+		),
+		(
+			"a: -Infinity",
+			"“-Infinity” is not a value. Negative infinity is written -infinity",
+		),
+		(
+			"a: -INFINITY",
+			"“-INFINITY” is not a value. Negative infinity is written -infinity",
+		),
+		(
+			"a: [-inf, 1]",
+			"“-inf” is not a value. Negative infinity is written -infinity",
+		),
+		(
+			"a: [-Infinity, 1]",
+			"“-Infinity” is not a value. Negative infinity is written -infinity",
+		),
+	]);
+}
+
+/**
+A “/” only ends a value for a suggestion when it starts a comment, so a suggestion never leaves out the text after it.
+*/
+#[test]
+fn a_slash_only_ends_a_value_for_a_suggestion_when_it_starts_a_comment() {
+	assert_reasons(&[
+		(
+			"speed: 100 km/h",
+			"Expected a line break before the next entry, but found “k”",
+		),
+		(
+			"a: 5 m/s",
+			"Expected a line break before the next entry, but found “m”",
+		),
+		(
+			"a: [5 m/s]",
+			"Expected “,”, a line break, or “]” after an array item, but found “m”",
+		),
+		(
+			"a: 2026-09-19T14:00:00/2026-09-20T15:00:00",
+			"An instant needs an offset: Z or ±HH:MM",
+		),
+		(
+			"a: [2026-09-19T14:00:00/P1D]",
+			"An instant needs an offset: Z or ±HH:MM",
+		),
+		(
+			"a: 2026-09-19T14:00:00 Z/x",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 5 m /* c */",
+			"A unit cannot follow a number after a space. Write a duration without the space, as in 5m, and anything else, such as a size, as a string, as in '5 m'",
+		),
+		(
+			"a: 5 m/* c */",
+			"A unit cannot follow a number after a space. Write a duration without the space, as in 5m, and anything else, such as a size, as a string, as in '5 m'",
+		),
+		(
+			"a: 2026-09-19T14:00:00/* c */",
+			"An instant needs an offset: Z or ±HH:MM. A date and time without an offset is a local time, which is not an instant, so write it as a string, as in '2026-09-19T14:00:00', or add the offset it was meant in",
+		),
+		(
+			"a: 2026-09-19T14:00:00 Z/* c */",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00Z",
+		),
+		(
+			"a: 2026-09-19T14:00:00 Z /* c */",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00Z",
+		),
+		(
+			"timeout: 5 s // seconds",
+			"A unit cannot follow a number after a space. Write a duration without the space, as in 5s, and anything else, such as a size, as a string, as in '5 s'",
+		),
+		(
+			"a: 5 m//c",
+			"A unit cannot follow a number after a space. Write a duration without the space, as in 5m, and anything else, such as a size, as a string, as in '5 m'",
+		),
+		(
+			"a: 2026-09-19T14:00:00 Z//c",
+			"An instant's offset follows its time directly, without a space, as in 2026-09-19T14:00:00Z",
+		),
+	]);
+}
+
+/**
+An underscore next to a letter is part of a word, not a misplaced separator in a number.
+*/
+#[test]
+fn an_underscore_next_to_a_letter_is_part_of_a_word() {
+	assert_reasons(&[
+		(
+			"a: 4k_video",
+			"Invalid number “4k_video”. A string value must be quoted, as in '4k_video'",
+		),
+		(
+			"a: 2x_speed",
+			"Invalid number “2x_speed”. A string value must be quoted, as in '2x_speed'",
+		),
+		(
+			"a: [5k_run, 2]",
+			"Invalid number “5k_run”. A string value must be quoted, as in '5k_run'",
+		),
+		(
+			"a: 1_",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1__0",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1_.5",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1._5",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1_e5",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1e_5",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1e5_",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1.5_",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: -1_",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1_000_",
+			"An underscore in a number must be between two digits",
+		),
+		(
+			"a: 1e-_5",
+			"An underscore in a number must be between two digits",
+		),
+	]);
+}
+
+/**
+An uppercase “E” is only an exponent marker where one goes, so in a word such as `5EUR` it is not.
+*/
+#[test]
+fn an_uppercase_e_is_only_an_exponent_marker_where_one_goes() {
+	assert_reasons(&[
+		(
+			"price: 5EUR",
+			"Invalid number “5EUR”. A string value must be quoted, as in '5EUR'",
+		),
+		(
+			"disk: 10EB",
+			"Invalid number “10EB”. A string value must be quoted, as in '10EB'",
+		),
+		(
+			"a: 1.5Ex",
+			"Invalid number “1.5Ex”. A string value must be quoted, as in '1.5Ex'",
+		),
+		(
+			"a: [3ED, 1]",
+			"Invalid number “3ED”. A string value must be quoted, as in '3ED'",
+		),
+		("a: 1E5", "An exponent marker is a lowercase “e”"),
+		("a: 1E10", "An exponent marker is a lowercase “e”"),
+		("a: 1.5E-3", "An exponent marker is a lowercase “e”"),
+		("a: -2E7", "An exponent marker is a lowercase “e”"),
+		("a: 1_0E1_0", "An exponent marker is a lowercase “e”"),
+		("a: 1E", "An exponent marker is a lowercase “e”"),
+		("a: 2E-", "An exponent marker is a lowercase “e”"),
+		("a: 1.5E", "An exponent marker is a lowercase “e”"),
+	]);
 }

@@ -25,9 +25,9 @@ In detail, as the spec states:
 - The lines of a block comment keep their indentation, and only the line it starts on is indented. As on every line outside a block string, trailing spaces and tabs go, and runs of blank lines collapse to one. A block comment that spans lines is part of the line it ends on.
 */
 
-use crate::scalar::{self, Scalar as Token, is_bare_key_byte};
-use crate::{Value, write};
-use std::fmt::Write;
+use crate::scalar;
+use crate::{Value, parse, write};
+use std::borrow::Cow;
 use std::ops::Range;
 
 pub(crate) mod format;
@@ -84,9 +84,9 @@ A member of an object: a key and a value.
 pub struct Member {
 	key: Key,
 	/**
-	The text between the `:` and the value, usually one space.
+	The text between the `:` and the value, usually one space, which is then not allocated.
 	*/
-	pub(crate) after_colon: String,
+	pub(crate) after_colon: Cow<'static, str>,
 	value: Node,
 	separator: Separator,
 	span: Option<Range<usize>>,
@@ -207,6 +207,9 @@ Like the other nodes, a key compares equal to another only when it is also writt
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
 	value: String,
+	/**
+	The text the author wrote for a quoted key. A parsed bare key is written as its value, so it has none.
+	*/
 	raw: Option<String>,
 	span: Option<Range<usize>>,
 }
@@ -482,13 +485,49 @@ impl Node {
 	}
 
 	/**
-	Whether the node is printed on one line, with no line break anywhere in it, also not in a comment or a block string. A line comment in changed decor counts as a line break, because the printer ends its line.
+	Whether the node is printed on one line, with no line break anywhere in it, also not in a comment or a block string. A line comment in changed decor counts as a line break, because the printer ends its line. A top-level object without braces counts as more than one line, because its members are on lines of their own.
+
+	It checks what the printer would write without writing it, because the formatter asks this of every container. A key has no line break, and neither has a scalar that was added or replaced, whose string is written with escapes.
 	*/
 	pub(crate) fn is_on_one_line(&self) -> bool {
-		let mut printer = Printer::new(false);
-		printer.node(self);
-		!printer.output.contains('\n')
+		match self {
+			Self::Object(object) => {
+				object.is_braced
+					&& is_decor_on_one_line(&object.closing)
+					&& object.members.iter().all(|member| {
+						is_decor_on_one_line(&member.after_colon)
+							&& member.separator.is_on_one_line()
+							&& member.value.is_on_one_line()
+					})
+			}
+			Self::Array(array) => {
+				is_decor_on_one_line(&array.closing)
+					&& array
+						.items
+						.iter()
+						.all(|item| item.separator.is_on_one_line() && item.value.is_on_one_line())
+			}
+			Self::Scalar(scalar) => scalar.raw.as_deref().is_none_or(|raw| !raw.contains('\n')),
+		}
 	}
+}
+
+impl Separator {
+	/**
+	Whether its decor is printed on one line, as for `Node::is_on_one_line`.
+	*/
+	fn is_on_one_line(&self) -> bool {
+		is_decor_on_one_line(&self.decor.leading)
+			&& is_decor_on_one_line(&self.before_comma)
+			&& is_decor_on_one_line(&self.decor.trailing)
+	}
+}
+
+/**
+Whether decor in a braced container is printed on one line: it has no line feed, also not in a block comment, and does not end in a line comment, after which the printer ends the line before the next token, at the latest the closing bracket.
+*/
+fn is_decor_on_one_line(decor: &str) -> bool {
+	!decor.contains('\n') && !ends_in_line_comment(decor)
 }
 
 impl Object {
@@ -597,14 +636,14 @@ impl Member {
 	Returns an error when the value holds something SOML cannot represent: NaN, a carriage return, or nesting of 100 levels or more, because a member is always inside an object, or when the key holds a carriage return.
 	*/
 	pub fn new(key: Key, value: impl Into<Value>) -> Result<Self, crate::Error> {
-		let value = checked(value.into())?;
+		let value = Node::new(value)?;
 
 		write::check_representable(key.value(), "key")?;
 
 		Ok(Self {
 			key,
-			after_colon: " ".to_owned(),
-			value: Node::from_value(value, ""),
+			after_colon: Cow::Borrowed(" "),
+			value,
 			separator: Separator::default(),
 			span: None,
 		})
@@ -613,7 +652,7 @@ impl Member {
 	fn laid_out(key: Key, value: Node, indentation: &str, is_first: bool) -> Self {
 		Self {
 			key,
-			after_colon: " ".to_owned(),
+			after_colon: Cow::Borrowed(" "),
 			value,
 			separator: Separator::laid_out(indentation, is_first),
 			span: None,
@@ -683,10 +722,8 @@ impl Item {
 	Returns an error when the value holds something SOML cannot represent: NaN, a carriage return, or nesting of 100 levels or more, because a node is always inside a collection.
 	*/
 	pub fn new(value: impl Into<Value>) -> Result<Self, crate::Error> {
-		let value = checked(value.into())?;
-
 		Ok(Self {
-			value: Node::from_value(value, ""),
+			value: Node::new(value)?,
 			separator: Separator::default(),
 		})
 	}
@@ -769,10 +806,9 @@ fn put_on_one_line<T: Entry>(entries: &mut [T], closing: &mut String) {
 Checks that a value can be written, so that a tree never holds something that cannot be printed.
 */
 pub(crate) fn checked(value: Value) -> Result<Value, crate::Error> {
-	let node = crate::parse::Node::from(value);
-	// As an item of a top-level array: one collection around it.
-	write::write_value(&mut String::new(), &node, 1, 1, false)?;
-	Ok(node.into_value())
+	// As an item of a top-level array: one collection around it. The serializer stops at the nesting limit, so a value built thousands of levels deep is an error, not a stack overflow.
+	serde_core::Serialize::serialize(&value, crate::ser::NodeSerializer { depth: 1 })?;
+	Ok(value)
 }
 
 impl Key {
@@ -817,7 +853,9 @@ impl Key {
 	*/
 	#[must_use]
 	pub fn raw(&self) -> Option<&str> {
-		self.raw.as_deref()
+		self.raw
+			.as_deref()
+			.or_else(|| self.span.is_some().then_some(self.value.as_str()))
 	}
 
 	/**
@@ -825,7 +863,7 @@ impl Key {
 	*/
 	#[must_use]
 	pub fn style(&self) -> StringStyle {
-		match &self.raw {
+		match self.raw() {
 			Some(raw) => StringStyle::of(raw),
 			None if scalar::is_bare_key(&self.value) => StringStyle::Bare,
 			None if write::needs_escapes(&self.value) => StringStyle::Escaped,
@@ -842,30 +880,42 @@ impl Key {
 	}
 }
 
+impl Key {
+	/**
+	The text the author wrote, or for a key that was added, the key written bare when it can be and quoted otherwise.
+	*/
+	pub(crate) fn text(&self) -> Cow<'_, str> {
+		match self.raw() {
+			Some(raw) => Cow::Borrowed(raw),
+			None => {
+				let mut text = String::new();
+				write::write_key(&mut text, &self.value)
+					.expect("writing to a String does not fail");
+				Cow::Owned(text)
+			}
+		}
+	}
+}
+
 impl std::fmt::Display for Key {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match &self.raw {
-			Some(raw) => formatter.write_str(raw),
-			None => write::write_key(formatter, &self.value),
-		}
+		formatter.write_str(&self.text())
 	}
 }
 
 impl Scalar {
 	/**
-	Writes the text the author wrote, or the canonical form of a value that was added or replaced.
+	The text the author wrote, or the canonical form of a value that was added or replaced.
 	*/
-	fn write_to(&self, output: &mut String) {
+	fn text(&self) -> Cow<'_, str> {
 		match &self.raw {
-			Some(raw) => output.push_str(raw),
-			None => write::write_value(
-				output,
-				&crate::parse::Node::from(self.value.clone()),
-				0,
-				0,
-				false,
-			)
-			.expect("a tree holds only scalars that can be written"),
+			Some(raw) => Cow::Borrowed(raw),
+			None => {
+				let mut text = String::new();
+				// A tree holds only scalars that can be written.
+				write::write_value(&mut text, &crate::parse::Node::from(self.value.clone()), 0);
+				Cow::Owned(text)
+			}
 		}
 	}
 
@@ -946,9 +996,9 @@ pub(crate) struct Parts {
 }
 
 /**
-Builds the tree of a document that the parser has already accepted, so it trusts its input.
+Builds the tree of a document from the parser's tree of it, `parsed`, which has its values and where they are. The builder adds the keys as written and the text around them.
 */
-pub(crate) fn build(source: &str) -> Parts {
+pub(crate) fn build(source: &str, parsed: parse::Node<'_>) -> Parts {
 	let builder = Builder {
 		source,
 		bytes: source.as_bytes(),
@@ -956,21 +1006,22 @@ pub(crate) fn build(source: &str) -> Parts {
 
 	let start = builder.skip_trivia(0);
 
-	if matches!(builder.bytes.get(start), Some(b'{' | b'[')) {
-		let (root, end) = builder.value(start);
-
+	// The parser rejects a document with only comments and whitespace, so a token is at `start`.
+	if !matches!(builder.bytes[start], b'{' | b'[') {
 		return Parts {
-			outer: Decor {
-				leading: source[..start].to_owned(),
-				trailing: source[end..].to_owned(),
-			},
-			root,
+			outer: Decor::default(),
+			root: Node::Object(builder.bare_object(parsed)),
 		};
 	}
 
+	let (root, end) = builder.value(parsed);
+
 	Parts {
-		outer: Decor::default(),
-		root: Node::Object(builder.bare_object()),
+		outer: Decor {
+			leading: source[..start].to_owned(),
+			trailing: source[end..].to_owned(),
+		},
+		root,
 	}
 }
 
@@ -983,84 +1034,87 @@ impl Builder<'_> {
 	/**
 	The index after the spaces, tabs, line feeds, and comments at `index`.
 	*/
-	fn skip_trivia(&self, mut index: usize) -> usize {
-		loop {
-			match self.bytes.get(index) {
-				Some(b' ' | b'\t' | b'\n') => index += 1,
-				Some(b'#') => {
-					index = scalar::line_end(self.bytes, index);
-				}
-				Some(b'/') if self.bytes.get(index + 1) == Some(&b'*') => {
-					index = crate::parse::block_comment_end(self.bytes, index)
-						.expect("the parser checked the comment")
-						+ 2
-				}
-				_ => return index,
-			}
-		}
+	fn skip_trivia(&self, index: usize) -> usize {
+		crate::parse::skip_trivia(self.bytes, index)
+			.expect("the parser checked the comments")
+			.0
 	}
 
 	/**
 	Splits the decor between `start` and `end` after its first line feed outside a block comment. Returns the index of the split, which is `start` when there is no line feed.
 	*/
 	fn split_after_line_feed(&self, start: usize, end: usize) -> usize {
-		decor_parts(&self.source[start..end])
-			.find(|(part, _)| *part == DecorPart::LineFeed)
-			.map_or(start, |(_, range)| start + range.end)
+		first_line_end(&self.source[start..end]).map_or(start, |end| start + end)
 	}
 
-	fn bare_object(&self) -> Object {
-		let mut members = Vec::new();
+	fn bare_object(&self, parsed: parse::Node<'_>) -> Object {
+		let parse::Kind::Object(object) = parsed.kind else {
+			unreachable!("a document without brackets is an object");
+		};
+
+		let count = object.members.len();
+		let mut members = Vec::with_capacity(count);
 		let mut leading_start = 0;
 
-		loop {
+		for (index, (key, parsed_member)) in object.members.into_iter().enumerate() {
 			let key_start = self.skip_trivia(leading_start);
-			let (mut member, value_end) = self.member(key_start);
+			let (mut member, value_end) = self.member(key, parsed_member);
 			member.separator.decor.leading = self.source[leading_start..key_start].to_owned();
 			let next = self.skip_trivia(value_end);
 			let mut split = self.split_after_line_feed(value_end, next);
 
 			// The last line of a document without a final line feed ends at the end of the text, so a comment there is the last member's.
-			if next >= self.bytes.len() && split == value_end {
+			if index + 1 == count && split == value_end {
 				split = self.bytes.len();
 			}
 
 			member.separator.decor.trailing = self.source[value_end..split].to_owned();
 			members.push(member);
-
-			if next >= self.bytes.len() {
-				return Object {
-					// From the first member to the end of the last, as in the JS reference. The text around them is decor.
-					span: Some(
-						members[0]
-							.span
-							.clone()
-							.expect("a parsed member has a span")
-							.start..value_end,
-					),
-					members,
-					is_braced: false,
-					closing: self.source[split..].to_owned(),
-				};
-			}
-
 			leading_start = split;
+		}
+
+		Object {
+			// From the first member to the end of the last, as in the JS reference. The text around them is decor.
+			span: Some(parsed.offset.get().expect("a parsed node has an offset")..parsed.end),
+			members,
+			is_braced: false,
+			closing: self.source[leading_start..].to_owned(),
 		}
 	}
 
 	/**
 	A member, without its decor, and the index after its value.
 	*/
-	fn member(&self, start: usize) -> (Member, usize) {
-		let (key, index) = self.key(start);
+	fn member(&self, key: Cow<'_, str>, parsed: parse::Member<'_>) -> (Member, usize) {
+		let start = parsed.key_offset.get().expect("a parsed key has an offset");
+		let (raw, end) = match self.bytes[start] {
+			b'\'' | b'"' => {
+				let end = scalar::string(self.source, start)
+					.expect("the parser checked the key")
+					.1;
+				(Some(self.source[start..end].to_owned()), end)
+			}
+			// A bare key has no escapes, so its value is its text in the source, with the same length.
+			_ => (None, start + key.len()),
+		};
+
+		let key = Key {
+			value: key.into_owned(),
+			raw,
+			span: Some(start..end),
+		};
 
 		// Past the `:`.
-		let value_start = self.skip_trivia(index + 1);
-		let (value, value_end) = self.value(value_start);
+		let after_colon_start = end + 1;
+		let (value, value_end) = self.value(parsed.value);
+		let value_start = value.span().expect("a parsed node has a span").start;
 
 		let member = Member {
 			key,
-			after_colon: self.source[index + 1..value_start].to_owned(),
+			after_colon: match &self.source[after_colon_start..value_start] {
+				" " => Cow::Borrowed(" "),
+				text => Cow::Owned(text.to_owned()),
+			},
 			value,
 			separator: Separator::default(),
 			span: Some(start..value_end),
@@ -1070,163 +1124,71 @@ impl Builder<'_> {
 	}
 
 	/**
-	A key, and the index after it.
-	*/
-	fn key(&self, start: usize) -> (Key, usize) {
-		let (value, end) = match self.bytes[start] {
-			b'\'' | b'"' => {
-				let (value, end) =
-					scalar::string(self.source, start).expect("the parser checked the key");
-				(value.into_owned(), end)
-			}
-			_ => {
-				let end = start
-					+ self.bytes[start..]
-						.iter()
-						.take_while(|&&byte| is_bare_key_byte(byte))
-						.count();
-				(self.source[start..end].to_owned(), end)
-			}
-		};
-
-		let key = Key {
-			value,
-			raw: Some(self.source[start..end].to_owned()),
-			span: Some(start..end),
-		};
-
-		(key, end)
-	}
-
-	/**
 	A value, and the index after it.
 	*/
-	fn value(&self, start: usize) -> (Node, usize) {
-		match self.bytes[start] {
-			b'{' => self.braced_object(start),
-			b'[' => self.array(start),
-			b'\'' | b'"' => {
-				let (value, end) =
-					scalar::string(self.source, start).expect("the parser checked the string");
-				(
-					self.scalar(Value::String(value.into_owned()), start, end),
-					end,
-				)
+	fn value(&self, parsed: parse::Node<'_>) -> (Node, usize) {
+		let start = parsed.offset.get().expect("a parsed node has an offset");
+		let end = parsed.end;
+
+		let node = match parsed.kind {
+			parse::Kind::Object(object) => {
+				let (members, closing) =
+					self.entries(start, end, object.members, |(key, member)| {
+						self.member(key, member)
+					});
+
+				Node::Object(Object {
+					members,
+					is_braced: true,
+					closing,
+					span: Some(start..end),
+				})
 			}
-			_ => {
-				let end = scalar::number_end(self.bytes, start);
-				let text = &self.source[start..end];
+			parse::Kind::Array(items) => {
+				let (items, closing) = self.entries(start, end, items, |item| {
+					let (value, end) = self.value(item);
+					let item = Item {
+						value,
+						separator: Separator::default(),
+					};
+					(item, end)
+				});
 
-				let value = match text {
-					"true" => Value::Bool(true),
-					"false" => Value::Bool(false),
-					"null" => Value::Null,
-					"infinity" => Value::Float(f64::INFINITY),
-					"-infinity" => Value::Float(f64::NEG_INFINITY),
-					_ => match scalar::token_value(text)
-						.and_then(Result::ok)
-						.expect("the parser checked the value")
-					{
-						Token::Int(value) => Value::Int(value),
-						Token::Float(value) => Value::Float(value),
-						Token::Instant(value) => Value::Instant(value),
-						Token::Duration(value) => Value::Duration(value),
-					},
-				};
-
-				(self.scalar(value, start, end), end)
+				Node::Array(Array {
+					items,
+					closing,
+					span: Some(start..end),
+				})
 			}
-		}
-	}
-
-	fn scalar(&self, value: Value, start: usize, end: usize) -> Node {
-		Node::Scalar(Scalar {
-			value,
-			raw: Some(self.source[start..end].to_owned()),
-			span: Some(start..end),
-		})
-	}
-
-	fn braced_object(&self, start: usize) -> (Node, usize) {
-		let mut members = Vec::new();
-
-		let (separators, closing, end) = self.items(start, b'}', |index| {
-			let (member, end) = self.member(index);
-			members.push(member);
-			end
-		});
-
-		for (member, separator) in members.iter_mut().zip(separators) {
-			member.separator = separator;
-		}
-
-		let object = Object {
-			members,
-			is_braced: true,
-			closing,
-			span: Some(start..end),
+			kind => Node::Scalar(Scalar {
+				value: parse::Node::from(kind).into_value(),
+				raw: Some(self.source[start..end].to_owned()),
+				span: Some(start..end),
+			}),
 		};
 
-		(Node::Object(object), end)
-	}
-
-	fn array(&self, start: usize) -> (Node, usize) {
-		let mut values = Vec::new();
-
-		let (separators, closing, end) = self.items(start, b']', |index| {
-			let (value, end) = self.value(index);
-			values.push(value);
-			end
-		});
-
-		let items = values
-			.into_iter()
-			.zip(separators)
-			.map(|(value, separator)| Item { value, separator })
-			.collect();
-
-		let array = Array {
-			items,
-			closing,
-			span: Some(start..end),
-		};
-
-		(Node::Array(array), end)
+		(node, end)
 	}
 
 	/**
-	Reads the items of a braced container that opens at `start`, with `item` reading one item and returning the index after it. Returns each item's separator, the closing decor, and the index after the closing bracket.
+	Reads the entries of a braced container from `start` to `end`, with `read` making one entry of a parsed one, without its separator, and returning the index after it. Returns the entries and the closing decor.
 	*/
-	fn items(
+	fn entries<P, T: Entry>(
 		&self,
 		start: usize,
-		closing_bracket: u8,
-		mut item: impl FnMut(usize) -> usize,
-	) -> (Vec<Separator>, String, usize) {
-		let mut separators = Vec::new();
+		end: usize,
+		parsed: Vec<P>,
+		mut read: impl FnMut(P) -> (T, usize),
+	) -> (Vec<T>, String) {
+		let mut entries = Vec::with_capacity(parsed.len());
 		let mut leading_start = start + 1;
 
-		loop {
+		for parsed in parsed {
 			let item_start = self.skip_trivia(leading_start);
+			let (mut entry, value_end) = read(parsed);
+			let separator = entry.separator_mut();
+			separator.decor.leading = self.source[leading_start..item_start].to_owned();
 
-			if self.bytes[item_start] == closing_bracket {
-				return (
-					separators,
-					self.source[leading_start..item_start].to_owned(),
-					item_start + 1,
-				);
-			}
-
-			let value_end = item(item_start);
-			separators.push(Separator {
-				decor: Decor {
-					leading: self.source[leading_start..item_start].to_owned(),
-					trailing: String::new(),
-				},
-				..Separator::default()
-			});
-
-			let separator = separators.last_mut().expect("a separator was pushed");
 			let after_value = self.skip_trivia(value_end);
 			let mut trailing_start = value_end;
 
@@ -1239,8 +1201,12 @@ impl Builder<'_> {
 			let next = self.skip_trivia(trailing_start);
 			let split = self.split_after_line_feed(trailing_start, next);
 			separator.decor.trailing = self.source[trailing_start..split].to_owned();
+			entries.push(entry);
 			leading_start = split;
 		}
+
+		// The text before the closing bracket.
+		(entries, self.source[leading_start..end - 1].to_owned())
 	}
 }
 
@@ -1308,10 +1274,7 @@ impl Printer {
 				let decor = &member.separator.decor;
 
 				// Members are separated by a line break, which an added member may not have in its decor.
-				if index > 0
-					&& !has_line_feed(&object.members[index - 1].separator.decor.trailing)
-					&& !has_line_feed(&decor.leading)
-				{
+				if index > 0 && shares_line_with_next(&object.members, index - 1) {
 					// The next write ends the line once, also after a line comment, which needs a line feed of its own.
 					self.needs_line_feed = true;
 				}
@@ -1332,8 +1295,7 @@ impl Printer {
 	}
 
 	fn member(&mut self, member: &Member) {
-		self.end_line_comment();
-		write!(self.output, "{}", member.key).expect("writing to a String does not fail");
+		self.write(&member.key.text());
 		self.output.push(':');
 		self.decor(&member.after_colon);
 		self.node(&member.value);
@@ -1366,14 +1328,14 @@ impl Printer {
 	}
 
 	fn scalar(&mut self, scalar: &Scalar) {
-		self.end_line_comment();
-		scalar.write_to(&mut self.output);
+		self.write(&scalar.text());
 	}
 
 	/**
 	Writes decor, and records the comments in it. Decor holds only whitespace and comments, so a `#` or the opening of a block comment in it always starts a comment.
 	*/
 	fn decor(&mut self, decor: &str) {
+		// A pending line comment needs a line feed after it. Decor that starts with a line feed gives it, and one more would add a blank line. Other decor would become part of the comment, so `end_line_comment` writes the line feed first.
 		if decor.starts_with('\n') {
 			self.needs_line_feed = false;
 		} else if !decor.is_empty() {
@@ -1437,6 +1399,7 @@ pub(crate) fn decor_parts(decor: &str) -> impl Iterator<Item = (DecorPart, Range
 					DecorPart::LineFeed
 				}
 				b'#' => {
+					// The line feed that ends the comment is not part of it, so the next part is that line feed.
 					index = scalar::line_end(bytes, index);
 					DecorPart::LineComment
 				}
@@ -1489,5 +1452,14 @@ pub(crate) fn ends_in_line_comment(decor: &str) -> bool {
 Whether decor has a line feed outside its block comments.
 */
 pub(crate) fn has_line_feed(decor: &str) -> bool {
-	decor_parts(decor).any(|(part, _)| part == DecorPart::LineFeed)
+	first_line_end(decor).is_some()
+}
+
+/**
+The index after the first line feed in decor that is not inside a block comment, which is where its first line ends.
+*/
+pub(crate) fn first_line_end(decor: &str) -> Option<usize> {
+	decor_parts(decor)
+		.find(|(part, _)| *part == DecorPart::LineFeed)
+		.map(|(_, range)| range.end)
 }

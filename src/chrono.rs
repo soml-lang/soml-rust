@@ -35,6 +35,7 @@ impl TryFrom<DateTime<Utc>> for Instant {
 			)));
 		}
 
+		// chrono, like `Instant`, counts the nanoseconds forward from the whole second, so a time before 1970 converts directly.
 		Self::from_unix(time.timestamp(), time.timestamp_subsec_nanos()).ok_or_else(|| {
 			Error::data(format!("The time {time} is outside the years 0001 to 9999"))
 		})

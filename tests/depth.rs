@@ -315,3 +315,131 @@ fn to_value_refuses_a_struct_named_duration_past_the_limit() {
 	assert!(soml::to_string(&Nested { arrays: LIMIT }).is_err());
 	assert!(soml::to_value(&Nested { arrays: LIMIT }).is_err());
 }
+
+#[test]
+fn a_change_with_a_value_nested_thousands_of_levels_deep_is_an_error_not_a_crash() {
+	// Deeper than the stack of a test thread holds when each level is converted before the depth is checked, but not so deep that dropping the value overflows it. `to_string` stops at the limit, and so must every change.
+	const DEPTH: usize = 3000;
+	let message =
+		"The value is nested more than 100 levels deep, so no reader would accept the document";
+
+	assert_eq!(
+		soml::to_string(&nested_arrays(DEPTH))
+			.expect_err("too deep")
+			.message(),
+		message
+	);
+
+	let mut document: soml::Document = "a: 1\n".parse().expect("a document");
+	let error = document
+		.set(["a"], nested_arrays(DEPTH))
+		.expect_err("too deep");
+	assert_eq!(
+		(error.kind(), error.message()),
+		(soml::ErrorKind::Write, message)
+	);
+	assert_eq!(document.to_string(), "a: 1\n");
+
+	assert_eq!(
+		soml::tree::Node::new(nested_arrays(DEPTH))
+			.expect_err("too deep")
+			.message(),
+		message
+	);
+	assert_eq!(
+		soml::tree::Item::new(nested_arrays(DEPTH))
+			.expect_err("too deep")
+			.message(),
+		message
+	);
+	assert_eq!(
+		soml::tree::Member::new(soml::tree::Key::new("a"), nested_arrays(DEPTH))
+			.expect_err("too deep")
+			.message(),
+		message
+	);
+}
+
+#[test]
+fn a_tree_node_counts_the_collection_it_is_in() {
+	// A node is always inside a collection, so it can hold 99 levels of its own.
+	assert!(soml::tree::Node::new(nested_arrays(LIMIT - 1)).is_ok());
+	assert!(soml::tree::Node::new(nested_arrays(LIMIT)).is_err());
+	assert!(soml::tree::Item::new(nested_objects(LIMIT - 1)).is_ok());
+	assert!(soml::tree::Item::new(nested_objects(LIMIT)).is_err());
+
+	let mut document: soml::Document = "a: 1\n".parse().expect("a document");
+	assert!(document.set(["a"], nested_arrays(LIMIT - 1)).is_ok());
+	assert!(document.set(["a"], nested_arrays(LIMIT)).is_err());
+}
+
+#[test]
+fn a_change_at_a_path_thousands_of_keys_long_is_an_error_not_a_crash() {
+	let path = vec!["k"; 5000];
+	let mut document: soml::Document = "a: 1\n".parse().expect("a document");
+	let error = document.set(path.clone(), 1).expect_err("too deep");
+	assert_eq!(
+		(error.kind(), error.message()),
+		(
+			soml::ErrorKind::Write,
+			"The document is nested more than 100 levels deep"
+		)
+	);
+	assert_eq!(document.to_string(), "a: 1\n");
+	assert!(!document.remove(path.clone()).expect("nothing to remove"));
+
+	// Below an index that appends to an array too.
+	let mut document: soml::Document = "[]".parse().expect("a document");
+	let mut indexed = vec![soml::PathSegment::Index(0)];
+	indexed.extend(path.iter().copied().map(soml::PathSegment::Key));
+	assert_eq!(
+		document.set(indexed, 1).expect_err("too deep").kind(),
+		soml::ErrorKind::Write
+	);
+	assert_eq!(document.to_string(), "[]");
+
+	// An index below a value that does not exist is still the error it names, however long the path is.
+	let mut document: soml::Document = "a: 1\n".parse().expect("a document");
+	let mut path: Vec<soml::PathSegment> = vec![soml::PathSegment::Key("k"); 5000];
+	path.push(soml::PathSegment::Index(0));
+	let error = document.set(path, 1).expect_err("no array");
+	assert_eq!(error.kind(), soml::ErrorKind::Data);
+	assert!(
+		error
+			.message()
+			.ends_with("does not exist, so it has no index 0"),
+		"{}",
+		error.message()
+	);
+
+	// The same with many keys after the index, which name objects that are never made.
+	let mut document: soml::Document = "a: 1\n".parse().expect("a document");
+	let mut path = vec![
+		soml::PathSegment::Key("missing"),
+		soml::PathSegment::Index(0),
+	];
+	path.extend(vec![soml::PathSegment::Key("k"); 1_000_000]);
+	let error = document.set(path, 1).expect_err("no array");
+	assert!(
+		error
+			.message()
+			.ends_with("does not exist, so it has no index 0"),
+		"{}",
+		error.message()
+	);
+}
+
+#[test]
+fn a_change_reaches_the_limit_exactly_at_the_end_of_its_path() {
+	// The top-level object and 98 new objects hold the value, which is an array: 100 levels.
+	let mut path = vec!["k"; 99];
+	let mut document: soml::Document = "a: 1\n".parse().expect("a document");
+	assert!(document.set(path.clone(), Value::Array(Vec::new())).is_ok());
+	assert!(document.to_value().is_ok());
+
+	path.push("k");
+	let mut document: soml::Document = "a: 1\n".parse().expect("a document");
+	assert!(document.set(path.clone(), 1).is_ok());
+	path.push("k");
+	assert!(document.set(path, 1).is_err());
+}

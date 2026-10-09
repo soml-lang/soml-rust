@@ -1,3 +1,4 @@
+use crate::scalar::{line_end, line_start};
 use std::fmt::{self, Display, Write};
 
 /**
@@ -228,17 +229,11 @@ impl Error {
 		let offset = character_start(text, position.offset);
 
 		let line = LineColumn::locate(text, offset).line;
-		let error_line_start = text[..offset].rfind('\n').map_or(0, |index| index + 1);
-		let mut line_starts = vec![error_line_start];
+		let mut line_starts = vec![line_start(text.as_bytes(), offset)];
 
 		while line_starts.len() <= CONTEXT_LINES && line_starts[0] > 0 {
-			let previous_end = line_starts[0] - 1;
-			line_starts.insert(
-				0,
-				text[..previous_end]
-					.rfind('\n')
-					.map_or(0, |index| index + 1),
-			);
+			// The line before ends at the line feed before this one.
+			line_starts.insert(0, line_start(text.as_bytes(), line_starts[0] - 1));
 		}
 
 		let first_line = line + 1 - line_starts.len();
@@ -248,9 +243,7 @@ impl Error {
 		for (index, &line_start) in line_starts.iter().enumerate() {
 			let number = first_line + index;
 			let is_error_line = number == line;
-			let line_end = text[line_start..]
-				.find('\n')
-				.map_or(text.len(), |length| line_start + length);
+			let line_end = line_end(text.as_bytes(), line_start);
 			let pointer = if is_error_line {
 				text[line_start..offset].chars().count()
 			} else {
@@ -310,6 +303,7 @@ fn clip(line: &str, pointer: usize) -> (Vec<char>, usize) {
 		return (line.chars().map(sanitize).collect(), pointer);
 	}
 
+	// The window is centered on the pointer, but it does not go past the end of the line.
 	let start = pointer
 		.saturating_sub(MAX_LINE_WIDTH / 2)
 		.min(length - MAX_LINE_WIDTH);
@@ -326,6 +320,7 @@ fn clip(line: &str, pointer: usize) -> (Vec<char>, usize) {
 		clipped.push('…');
 	}
 
+	// The leading `…` moves the pointer one character to the right.
 	let pointer = pointer - start + usize::from(start > 0);
 	(clipped, pointer)
 }
@@ -365,10 +360,7 @@ impl LineColumn {
 		let offset = character_start(source, offset);
 
 		let before = &source.as_bytes()[..offset];
-		let line_start = before
-			.iter()
-			.rposition(|&byte| byte == b'\n')
-			.map_or(0, |index| index + 1);
+		let line_start = line_start(source.as_bytes(), offset);
 		let line = before.iter().filter(|&&byte| byte == b'\n').count() + 1;
 
 		// A UTF-8 continuation byte does not start a scalar value, so counting the other bytes counts the scalar values.

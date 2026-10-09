@@ -1,17 +1,17 @@
 /*!
-The parser. It checks every rule in the spec and builds a tree in which every value and key knows its offset in the source, so that a deserialization error can say where it is.
+The parser. It checks every rule in the spec and builds a tree in which every value and key knows its offset in the source, so that a deserialization error can say where it is. Its steps are also used one at a time, by the deserializer that reads a document without the tree, and `ObjectKeys` finds duplicate keys for that deserializer.
 */
 
 use crate::instant::describe_malformed_instant;
 use crate::scalar::{
-	self, MAX_DIAGNOSED_LENGTH, Scalar, ScalarError, describe_bad_number, describe_character,
+	self, MAX_DIAGNOSED_LENGTH, ScalarError, bare_key_end, describe_bad_number, describe_character,
 	describe_unknown_word, has_date_prefix, is_bare_key, is_bare_key_byte,
-	is_quotable_key_character, quoting_example,
+	is_quotable_key_character, line_start, quoting_example, skip_spaces,
 };
 use crate::tree::Key;
 use crate::{Duration, Error, Instant, abbreviate};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
 
@@ -39,6 +39,34 @@ pub(crate) struct Node<'de> {
 	pub end: usize,
 }
 
+impl Node<'_> {
+	/**
+	Sorts the members of every object by key, for canonical form.
+	*/
+	pub(crate) fn sort_members(&mut self) {
+		match &mut self.kind {
+			Kind::Object(object) => {
+				// A `str` compares byte by byte, which for UTF-8 is the order of Unicode scalar values, as canonical form requires. Keys are unique, so the sort does not need to be stable.
+				object
+					.members
+					.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+				// The positions changed, and the members are only written from here on.
+				object.index = None;
+
+				for (_, member) in &mut object.members {
+					member.value.sort_members();
+				}
+			}
+			Kind::Array(items) => {
+				for item in items {
+					item.sort_members();
+				}
+			}
+			_ => {}
+		}
+	}
+}
+
 impl<'de> From<Kind<'de>> for Node<'de> {
 	/**
 	A node that did not come from a document.
@@ -62,6 +90,7 @@ impl Offset {
 	pub(crate) const NONE: Self = Self(None);
 
 	pub(crate) fn at(offset: usize) -> Self {
+		// Stored as one more than the offset, so that offset 0 is not the zero that means `None`. The sum cannot overflow, because a source is never longer than `isize::MAX` bytes.
 		Self(NonZeroUsize::new(offset + 1))
 	}
 
@@ -125,6 +154,7 @@ const MAX_UNINDEXED_MEMBERS: usize = 16;
 
 impl<'de> Object<'de> {
 	pub(crate) fn new(members: Vec<(Cow<'de, str>, Member<'de>)>) -> Self {
+		// No index here. `push` makes the index when an object becomes large, and an object made from a `Value` is only read in order, so nothing searches it by key.
 		Self {
 			members,
 			index: None,
@@ -144,6 +174,7 @@ impl<'de> Object<'de> {
 	pub(crate) fn push(&mut self, key: Cow<'de, str>, member: Member<'de>) -> usize {
 		let position = self.members.len();
 
+		// Every caller checks first that the key is new, so the index never maps a key to two members.
 		if let Some(index) = &mut self.index {
 			index.insert(key.clone(), position);
 		} else if position == MAX_UNINDEXED_MEMBERS {
@@ -162,6 +193,92 @@ impl<'de> Object<'de> {
 	}
 }
 
+/**
+The number of keys up to which `ObjectKeys` and the writer's `WrittenKeys` compare keys, and only when the filter finds a key that may be a duplicate. Past it, many of the filter's bits are set, so the keys are compared more often, and a hash set is faster.
+*/
+pub(crate) const MAX_FILTERED_KEYS: usize = 32;
+
+/**
+The keys of one object that the stream deserializer reads, to find a duplicate key. The keys of all open objects share one stack, the innermost object's last, because an inner object ends before the next key of its parent.
+*/
+pub(crate) struct ObjectKeys<'a> {
+	/**
+	Where the keys of this object start in the stack.
+	*/
+	start: usize,
+	/**
+	A bit for the fingerprint of each key. A key whose bit is not set is new, so the keys are compared only when it is set.
+	*/
+	filter: u64,
+	/**
+	The keys, once the object has too many to compare one at a time. They are no longer in the stack then.
+	*/
+	index: Option<HashSet<Cow<'a, str>>>,
+}
+
+impl<'a> ObjectKeys<'a> {
+	pub(crate) fn new(stack: &[Cow<'a, str>]) -> Self {
+		Self {
+			start: stack.len(),
+			filter: 0,
+			index: None,
+		}
+	}
+
+	/**
+	Remembers `key`, and returns `false` when the object has it already.
+	*/
+	#[inline]
+	pub(crate) fn insert(&mut self, stack: &mut Vec<Cow<'a, str>>, key: Cow<'a, str>) -> bool {
+		if let Some(index) = &mut self.index {
+			return index.insert(key);
+		}
+
+		let bit = 1 << fingerprint(key.as_bytes());
+
+		// The first byte is compared before the whole key, which avoids most calls to compare memory for keys of the same length.
+		if self.filter & bit != 0
+			&& stack[self.start..].iter().any(|other| {
+				other.len() == key.len()
+					&& other.as_bytes().first() == key.as_bytes().first()
+					&& *other == key
+			}) {
+			return false;
+		}
+
+		self.filter |= bit;
+		stack.push(key);
+
+		if stack.len() - self.start > MAX_FILTERED_KEYS {
+			self.index = Some(stack.drain(self.start..).collect());
+		}
+
+		true
+	}
+
+	/**
+	Removes the keys of this object, which has ended, from the stack.
+	*/
+	pub(crate) fn end(&self, stack: &mut Vec<Cow<'a, str>>) {
+		stack.truncate(self.start);
+	}
+}
+
+/**
+A number from 0 to 63 for a key, from its length and three of its bytes, which differ between most keys of an object.
+*/
+pub(crate) fn fingerprint(bytes: &[u8]) -> u32 {
+	let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+		return 0;
+	};
+	let middle = bytes[bytes.len() / 2];
+	let mixed = u32::from(first)
+		| u32::from(middle) << 8
+		| u32::from(last) << 16
+		| (bytes.len() as u32) << 24;
+	mixed.wrapping_mul(0x9E37_79B1) >> 26
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Member<'de> {
 	/**
@@ -177,14 +294,7 @@ Parses a document.
 pub(crate) fn parse(source: &str) -> Result<Node<'_>, Error> {
 	check_characters(source)?;
 
-	let mut parser = Parser {
-		source,
-		bytes: source.as_bytes(),
-		index: 0,
-		document_start: 0,
-	};
-
-	parser
+	Parser::new(source)
 		.parse_document()
 		.map_err(|error| Error::at(error.message, source, error.offset))
 }
@@ -193,6 +303,7 @@ pub(crate) fn parse(source: &str) -> Result<Node<'_>, Error> {
 Whether `text` is one valid value, so that an error message only suggests a fix that works.
 */
 pub(crate) fn is_valid_value(text: &str) -> bool {
+	// The brackets make a document of a value of any type, and the count rejects text such as `1, 2`, which holds more than one value.
 	parse(&format!("[{text}]"))
 		.is_ok_and(|node| matches!(node.kind, Kind::Array(items) if items.len() == 1))
 }
@@ -223,7 +334,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<&str, Error> {
 /**
 Characters that are errors wherever they appear, so they are checked once, up front, as in the JS reference.
 */
-fn check_characters(source: &str) -> Result<(), Error> {
+pub(crate) fn check_characters(source: &str) -> Result<(), Error> {
 	if source.starts_with('\u{FEFF}') {
 		return Err(Error::at(
 			"A byte order mark (BOM) is not allowed",
@@ -268,10 +379,15 @@ The offset of the first raw control character. Each block is checked without sto
 fn find_control(bytes: &[u8]) -> Option<usize> {
 	const BLOCK: usize = 32;
 
-	for (block_index, block) in bytes.chunks(BLOCK).enumerate() {
+	// Blocks of a fixed size, and a `u8` rather than a `bool` for whether one was found, because only with both does the compiler check many bytes at once, with SIMD instructions.
+	let (blocks, remainder) = bytes.as_chunks::<BLOCK>();
+	let remainder_start = bytes.len() - remainder.len();
+
+	for (block_index, block) in blocks.iter().enumerate() {
 		if block
 			.iter()
-			.fold(false, |found, &byte| found | is_control(byte))
+			.fold(0, |found, &byte| found | u8::from(is_control(byte)))
+			!= 0
 		{
 			return block
 				.iter()
@@ -280,15 +396,22 @@ fn find_control(bytes: &[u8]) -> Option<usize> {
 		}
 	}
 
-	None
+	bytes[remainder_start..]
+		.iter()
+		.position(|&byte| is_control(byte))
+		.map(|position| remainder_start + position)
 }
 
 type Result<T, E = ScalarError> = std::result::Result<T, E>;
 
-struct Parser<'de> {
+/**
+A cursor in a document. It reads a whole tree with `parse_document`, or one step at a time, for a reader that does not build a tree.
+*/
+#[derive(Clone)]
+pub(crate) struct Parser<'de> {
 	source: &'de str,
 	bytes: &'de [u8],
-	index: usize,
+	pub(crate) index: usize,
 	/**
 	Where the document's collection starts, after the comments and whitespace before it.
 	*/
@@ -296,6 +419,15 @@ struct Parser<'de> {
 }
 
 impl<'de> Parser<'de> {
+	pub(crate) const fn new(source: &'de str) -> Self {
+		Self {
+			source,
+			bytes: source.as_bytes(),
+			index: 0,
+			document_start: 0,
+		}
+	}
+
 	#[cold]
 	fn fail<T>(&self, message: impl Into<String>, offset: usize) -> Result<T> {
 		Err(ScalarError::new(message, offset))
@@ -309,15 +441,33 @@ impl<'de> Parser<'de> {
 		)
 	}
 
-	fn peek(&self) -> Option<u8> {
+	#[inline]
+	pub(crate) fn peek(&self) -> Option<u8> {
 		self.bytes.get(self.index).copied()
 	}
 
+	#[inline]
 	fn is_at_end(&self) -> bool {
 		self.index >= self.bytes.len()
 	}
 
 	fn parse_document(&mut self) -> Result<Node<'de>> {
+		self.start_document()?;
+
+		let value = match self.peek() {
+			Some(b'{') => self.parse_object(1)?,
+			Some(b'[') => self.parse_array(1)?,
+			_ => self.parse_bare_object()?,
+		};
+
+		self.end_document()?;
+		Ok(value)
+	}
+
+	/**
+	Steps past the comments and whitespace before the document's collection.
+	*/
+	pub(crate) fn start_document(&mut self) -> Result<()> {
 		self.skip_trivia()?;
 		self.document_start = self.index;
 
@@ -328,12 +478,13 @@ impl<'de> Parser<'de> {
 			);
 		}
 
-		let value = match self.peek() {
-			Some(b'{') => self.parse_object(1)?,
-			Some(b'[') => self.parse_array(1)?,
-			_ => self.parse_bare_object()?,
-		};
+		Ok(())
+	}
 
+	/**
+	Checks that only comments and whitespace follow the document's collection.
+	*/
+	pub(crate) fn end_document(&mut self) -> Result<()> {
 		self.skip_trivia()?;
 
 		if !self.is_at_end() {
@@ -346,13 +497,13 @@ impl<'de> Parser<'de> {
 			);
 		}
 
-		Ok(value)
+		Ok(())
 	}
 
 	/**
 	`bare-object = entry ( entry-sep entry )*`, where a separator is one or more line breaks.
 	*/
-	fn parse_bare_object(&mut self) -> Result<Node<'de>> {
+	pub(crate) fn parse_bare_object(&mut self) -> Result<Node<'de>> {
 		let start = self.index;
 		let mut object = Object::default();
 
@@ -363,38 +514,48 @@ impl<'de> Parser<'de> {
 		// From the first member to the end of the last one's value. The text around them is not part of the object.
 		let mut end = self.index;
 
-		loop {
-			let has_line_break = self.skip_trivia()?;
-
-			if self.is_at_end() {
-				return Ok(Node {
-					kind: Kind::Object(object),
-					offset: Offset::at(start),
-					end,
-				});
-			}
-
-			if self.peek() == Some(b',') {
-				return self.fail(
-					"Top-level entries are separated by line breaks, not commas. Use braces for a one-line object",
-					self.index,
-				);
-			}
-
-			if !has_line_break {
-				return self.fail(
-					format!(
-						"Expected a line break before the next entry, but found {}{}",
-						self.describe_here(),
-						self.slash_comment_hint()
-					),
-					self.index,
-				);
-			}
-
+		while self.next_bare_entry()? {
 			self.parse_entry(&mut object, 1)?;
 			end = self.index;
 		}
+
+		Ok(Node {
+			kind: Kind::Object(object),
+			offset: Offset::at(start),
+			end,
+		})
+	}
+
+	/**
+	Steps to the next entry of a top-level object without braces, after its first, and returns whether there is one. The entries are separated by line breaks.
+	*/
+	#[inline]
+	pub(crate) fn next_bare_entry(&mut self) -> Result<bool> {
+		let has_line_break = self.skip_trivia()?;
+
+		if self.is_at_end() {
+			return Ok(false);
+		}
+
+		if self.peek() == Some(b',') {
+			return self.fail(
+				"Top-level entries are separated by line breaks, not commas. Use braces for a one-line object",
+				self.index,
+			);
+		}
+
+		if !has_line_break {
+			return self.fail(
+				format!(
+					"Expected a line break before the next entry, but found {}{}",
+					self.describe_here(),
+					self.slash_comment_hint()
+				),
+				self.index,
+			);
+		}
+
+		Ok(true)
 	}
 
 	/**
@@ -412,44 +573,11 @@ impl<'de> Parser<'de> {
 	/**
 	Skips spaces, tabs, line breaks, and comments, and returns whether it crossed a line break. A line break inside a block comment does not count.
 	*/
+	#[inline]
 	fn skip_trivia(&mut self) -> Result<bool> {
-		let mut has_line_break = false;
-
-		loop {
-			match self.peek() {
-				Some(b' ' | b'\t') => self.index += 1,
-				Some(b'\n') => {
-					has_line_break = true;
-					self.index += 1;
-				}
-				Some(b'#') => {
-					self.index = scalar::line_end(self.bytes, self.index);
-				}
-				Some(b'/') if self.bytes.get(self.index + 1) == Some(&b'*') => {
-					self.skip_block_comment()?
-				}
-				_ => return Ok(has_line_break),
-			}
-		}
-	}
-
-	fn skip_block_comment(&mut self) -> Result<()> {
-		let start = self.index;
-		let end = block_comment_end(self.bytes, start);
-		let Some(end) = end else {
-			return self.fail("Unterminated block comment", start);
-		};
-
-		// The body may not contain `/*`. An opening that overlaps the closing `*/`, as in `/*/`, is not inside the body.
-		if let Some(nested) = find(&self.bytes[start + 2..end], b"/*") {
-			return self.fail(
-				"Block comments cannot be nested, and their body may not contain “/*”",
-				start + 2 + nested,
-			);
-		}
-
-		self.index = end + 2;
-		Ok(())
+		let (index, has_line_break) = skip_trivia(self.bytes, self.index)?;
+		self.index = index;
+		Ok(has_line_break)
 	}
 
 	/**
@@ -457,22 +585,11 @@ impl<'de> Parser<'de> {
 	*/
 	fn parse_entry(&mut self, object: &mut Object<'de>, depth: usize) -> Result<()> {
 		let key_start = self.index;
-		let key = self.parse_key()?;
-
-		if self.peek() == Some(b'.') {
-			return self.fail_dot_in_key(key_start);
-		}
-
-		if self.peek() != Some(b':') {
-			return self.fail_missing_colon(key_start);
-		}
-
-		let colon = self.index;
-		self.index += 1;
-		self.skip_trivia()?;
+		let (key, colon) = self.parse_entry_key()?;
 		let value = match self.parse_value(depth + 1) {
 			Ok(value) => value,
 			Err(error) => {
+				// `diagnose_bad_value` returns a more precise error as `Err`, and `Ok` when the original error stays.
 				self.diagnose_bad_value(&error, &key, key_start, colon)?;
 				return Err(error);
 			}
@@ -491,6 +608,28 @@ impl<'de> Parser<'de> {
 		);
 
 		Ok(())
+	}
+
+	/**
+	`key ":" ws`, the part of an entry before its value. Returns the key and the offset of the colon.
+	*/
+	#[inline]
+	pub(crate) fn parse_entry_key(&mut self) -> Result<(Cow<'de, str>, usize)> {
+		let key_start = self.index;
+		let key = self.parse_key()?;
+
+		if self.peek() == Some(b'.') {
+			return self.fail_dot_in_key(key_start);
+		}
+
+		if self.peek() != Some(b':') {
+			return self.fail_missing_colon(key_start);
+		}
+
+		let colon = self.index;
+		self.index += 1;
+		self.skip_trivia()?;
+		Ok((key, colon))
 	}
 
 	/**
@@ -688,12 +827,7 @@ impl<'de> Parser<'de> {
 
 	#[cold]
 	fn fail_missing_colon<T>(&mut self, key_start: usize) -> Result<T> {
-		let mut next = self.index;
-
-		while matches!(self.bytes.get(next), Some(b' ' | b'\t')) {
-			next += 1;
-		}
-
+		let next = skip_spaces(self.bytes, self.index);
 		let next_byte = self.bytes.get(next).copied();
 
 		if next > self.index && next_byte == Some(b':') {
@@ -706,10 +840,7 @@ impl<'de> Parser<'de> {
 		// A block comment that the “:” follows was meant to come before it.
 		if self.bytes[next..].starts_with(b"/*")
 			&& let Some(comment_end) = block_comment_end(self.bytes, next)
-			&& self.bytes[comment_end + 2..]
-				.iter()
-				.find(|&&byte| byte != b' ' && byte != b'\t')
-				== Some(&b':')
+			&& self.bytes.get(skip_spaces(self.bytes, comment_end + 2)) == Some(&b':')
 		{
 			return self.fail("A comment is not allowed between a key and its “:”", next);
 		}
@@ -764,6 +895,7 @@ impl<'de> Parser<'de> {
 		)
 	}
 
+	#[inline]
 	fn parse_key(&mut self) -> Result<Cow<'de, str>> {
 		let start = self.index;
 
@@ -779,36 +911,37 @@ impl<'de> Parser<'de> {
 				Ok(value)
 			}
 			_ => {
-				let end = start
-					+ self.bytes[start..]
-						.iter()
-						.take_while(|&&byte| is_bare_key_byte(byte))
-						.count();
+				let end = bare_key_end(self.bytes, start);
 
 				if end == start {
-					if self.peek() == Some(b'[') {
-						self.diagnose_table_header(false)?;
-					}
-
-					if self.is_at_end() {
-						return self.fail("Expected a key", start);
-					}
-
-					return self.fail(
-						format!(
-							"Expected a key, but found {}{}{}",
-							self.describe_here(),
-							self.key_quoting_hint(),
-							self.slash_comment_hint()
-						),
-						start,
-					);
+					return self.fail_missing_key(start);
 				}
 
 				self.index = end;
 				Ok(Cow::Borrowed(&self.source[start..end]))
 			}
 		}
+	}
+
+	#[cold]
+	fn fail_missing_key<T>(&self, start: usize) -> Result<T> {
+		if self.peek() == Some(b'[') {
+			self.diagnose_table_header(false)?;
+		}
+
+		if self.is_at_end() {
+			return self.fail("Expected a key", start);
+		}
+
+		self.fail(
+			format!(
+				"Expected a key, but found {}{}{}",
+				self.describe_here(),
+				self.key_quoting_hint(),
+				self.slash_comment_hint()
+			),
+			start,
+		)
 	}
 
 	/**
@@ -916,83 +1049,135 @@ impl<'de> Parser<'de> {
 		collection: Collection,
 		mut item: impl FnMut(&mut Self) -> Result<()>,
 	) -> Result<usize> {
-		let start = self.index;
-		let closing = collection.closing();
-		let closing_text = char::from(closing);
-		let (container, item_name) = collection.names();
+		let start = self.open_braced(depth)?;
 
+		while self.next_braced_item(collection, start)? {
+			item(self)?;
+			self.after_braced_item(collection, start)?;
+		}
+
+		Ok(start)
+	}
+
+	/**
+	Steps into the braced container that opens here, at the nesting depth `depth`, and returns the offset of its opening bracket.
+	*/
+	#[inline]
+	pub(crate) fn open_braced(&mut self, depth: usize) -> Result<usize> {
+		let start = self.index;
+
+		// Only objects and arrays count toward the depth, so the check is here and not in `parse_value`. The limit also bounds the recursion, so a deep document cannot overflow the stack.
 		if depth > MAX_DEPTH {
 			return self.fail_too_deep(start);
 		}
 
 		self.index += 1;
 		self.skip_trivia()?;
+		Ok(start)
+	}
 
-		loop {
-			if self.peek() == Some(closing) {
-				self.index += 1;
-				return Ok(start);
-			}
+	/**
+	Returns whether an item of the braced container that opens at `start` follows, or steps past its closing bracket.
+	*/
+	#[inline]
+	pub(crate) fn next_braced_item(
+		&mut self,
+		collection: Collection,
+		start: usize,
+	) -> Result<bool> {
+		let closing = collection.closing();
 
-			if self.is_at_end() {
-				return self.fail(
-					format!("Unterminated {container}: expected “{closing_text}”"),
-					start,
-				);
-			}
+		if self.peek() == Some(closing) {
+			self.index += 1;
+			return Ok(false);
+		}
 
-			item(self)?;
-			let item_end = self.index;
-			let has_line_break = self.skip_trivia()?;
+		if self.is_at_end() {
+			return self.fail_unterminated(collection, start);
+		}
 
-			// Items are separated by a comma, a line break, or both. A line break inside a block comment does not count.
-			match self.peek() {
-				Some(b',') => {
-					if has_line_break {
-						return self.fail(
-							"A comma must be on the same line as the item before it. The line break already separates the items, so remove the comma",
-							self.index,
-						);
-					}
+		Ok(true)
+	}
 
-					self.index += 1;
-					self.skip_trivia()?;
-				}
-				Some(byte) if byte == closing || has_line_break => {}
-				None => {
+	/**
+	Steps past the separator after an item of the braced container that opens at `start`.
+	*/
+	#[inline]
+	pub(crate) fn after_braced_item(&mut self, collection: Collection, start: usize) -> Result<()> {
+		let closing = collection.closing();
+		let item_end = self.index;
+		let has_line_break = self.skip_trivia()?;
+
+		// Items are separated by a comma, a line break, or both. A line break inside a block comment does not count.
+		match self.peek() {
+			Some(b',') => {
+				if has_line_break {
 					return self.fail(
-						format!("Unterminated {container}: expected “{closing_text}”"),
-						start,
-					);
-				}
-				Some(_) => {
-					// Without a line break that separates, a line break in the gap is inside a block comment.
-					let hint = if self.bytes[item_end..self.index].contains(&b'\n') {
-						". A line break inside a block comment does not separate items"
-					} else {
-						self.slash_comment_hint()
-					};
-
-					return self.fail(
-						format!(
-							"Expected “,”, a line break, or “{closing_text}” after an {container} {item_name}, but found {}{hint}",
-							self.describe_here()
-						),
+						"A comma must be on the same line as the item before it. The line break already separates the items, so remove the comma",
 						self.index,
 					);
 				}
+
+				self.index += 1;
+				self.skip_trivia()?;
 			}
+			Some(byte) if byte == closing || has_line_break => {}
+			None => return self.fail_unterminated(collection, start),
+			Some(_) => {
+				let (container, item_name) = collection.names();
+				let closing_text = char::from(closing);
+
+				// Without a line break that separates, a line break in the gap is inside a block comment.
+				let hint = if self.bytes[item_end..self.index].contains(&b'\n') {
+					". A line break inside a block comment does not separate items"
+				} else {
+					self.slash_comment_hint()
+				};
+
+				return self.fail(
+					format!(
+						"Expected “,”, a line break, or “{closing_text}” after an {container} {item_name}, but found {}{hint}",
+						self.describe_here()
+					),
+					self.index,
+				);
+			}
+		}
+
+		Ok(())
+	}
+
+	#[cold]
+	fn fail_unterminated<T>(&self, collection: Collection, start: usize) -> Result<T> {
+		let (container, _) = collection.names();
+
+		self.fail(
+			format!(
+				"Unterminated {container}: expected “{}”",
+				char::from(collection.closing())
+			),
+			start,
+		)
+	}
+
+	pub(crate) fn parse_value(&mut self, depth: usize) -> Result<Node<'de>> {
+		match self.peek() {
+			Some(b'{') => self.parse_object(depth),
+			Some(b'[') => self.parse_array(depth),
+			_ => self.parse_scalar(),
 		}
 	}
 
-	fn parse_value(&mut self, depth: usize) -> Result<Node<'de>> {
+	/**
+	A value that is not an object or an array.
+	*/
+	#[inline]
+	pub(crate) fn parse_scalar(&mut self) -> Result<Node<'de>> {
 		let start = self.index;
 		// An int or a float written with digits.
 		let mut is_number = false;
 
 		let kind = match self.peek() {
-			Some(b'{') => return self.parse_object(depth),
-			Some(b'[') => return self.parse_array(depth),
 			Some(b'\'' | b'"') => {
 				let (value, end) = scalar::string(self.source, start)?;
 				self.index = end;
@@ -1004,34 +1189,14 @@ impl<'de> Parser<'de> {
 			Some(b'i') if self.eat_keyword("infinity") => Kind::Float(f64::INFINITY),
 			Some(b'-') if self.eat_keyword("-infinity") => Kind::Float(f64::NEG_INFINITY),
 			Some(b'0'..=b'9' | b'-') => {
-				if let Some((kind, end)) = self.plain_number(start) {
-					self.index = end;
-
-					if self.is_word_after_space() {
-						self.diagnose_unit_after_space(start)?;
-					}
-
-					return Ok(Node {
-						kind,
-						offset: Offset::at(start),
-						end,
-					});
-				}
-
 				let end = scalar::number_end(self.bytes, start);
 				self.index = end;
 
 				match scalar::token_value(&self.source[start..end]) {
-					Some(Ok(Scalar::Int(value))) => {
-						is_number = true;
-						Kind::Int(value)
+					Some(Ok(kind)) => {
+						is_number = matches!(kind, Kind::Int(_) | Kind::Float(_));
+						kind
 					}
-					Some(Ok(Scalar::Float(value))) => {
-						is_number = true;
-						Kind::Float(value)
-					}
-					Some(Ok(Scalar::Instant(value))) => Kind::Instant(value),
-					Some(Ok(Scalar::Duration(value))) => Kind::Duration(value),
 					Some(Err(message)) => {
 						let message = self
 							.describe_malformed_instant(start, end)
@@ -1122,10 +1287,7 @@ impl<'de> Parser<'de> {
 
 		// A keyword after a number is a missing comma.
 		if unit.is_empty()
-			|| self
-				.bytes
-				.get(skip_spaces(self.bytes, unit_end))
-				.is_some_and(|&byte| !can_follow_value(byte))
+			|| !is_value_end_at(self.bytes, skip_spaces(self.bytes, unit_end))
 			|| matches!(unit, "true" | "false" | "null" | "infinity")
 		{
 			return Ok(());
@@ -1177,12 +1339,35 @@ impl<'de> Parser<'de> {
 		};
 
 		// More of the instant may follow, as in `14:00:00,5Z` or `14:00:00[Europe/Oslo]`, so it may have an offset.
-		let next = self.bytes.get(time_end).copied();
-		let is_whole_value = next.is_none_or(can_follow_value)
-			&& !(next == Some(b',')
+		let is_whole_value = is_value_end_at(self.bytes, time_end)
+			&& !(self.bytes.get(time_end) == Some(&b',')
 				&& self.bytes.get(time_end + 1).is_some_and(u8::is_ascii_digit));
 
-		describe_malformed_instant(text, time, is_whole_value)
+		describe_malformed_instant(text, time, is_whole_value, self.offset_after_space(end))
+	}
+
+	/**
+	An offset on its own after spaces at `index`, as in `2026-09-19T14:00:00 Z`, which belongs directly after the time, or `None`.
+	*/
+	fn offset_after_space(&self, index: usize) -> Option<&'de str> {
+		let start = skip_spaces(self.bytes, index);
+
+		if start == index {
+			return None;
+		}
+
+		let length = match self.bytes.get(start..)? {
+			[b'Z', ..] => 1,
+			[b'+' | b'-', a, b, b':', c, d, ..]
+				if [a, b, c, d].iter().all(|byte| byte.is_ascii_digit()) =>
+			{
+				6
+			}
+			_ => return None,
+		};
+
+		// The offset is ASCII, so its ends are character boundaries.
+		is_value_end_at(self.bytes, start + length).then(|| &self.source[start..start + length])
 	}
 
 	/**
@@ -1282,61 +1467,6 @@ impl<'de> Parser<'de> {
 	}
 
 	/**
-	The common case of a short decimal int or float, such as `8080`, `-3`, or `30.5`, without the general path's scan and checks. Anything else, including every error, returns `None` and is left to the general path.
-	*/
-	fn plain_number(&self, start: usize) -> Option<(Kind<'de>, usize)> {
-		let bytes = self.bytes;
-		let integer_start = start + usize::from(bytes[start] == b'-');
-		let integer_end = integer_start
-			+ bytes[integer_start..]
-				.iter()
-				.take_while(|byte| byte.is_ascii_digit())
-				.count();
-		let integer_length = integer_end - integer_start;
-
-		// No digits, or a leading zero, which is either `0` alone or an error.
-		if integer_length == 0 || (integer_length > 1 && bytes[integer_start] == b'0') {
-			return None;
-		}
-
-		let mut end = integer_end;
-
-		if bytes.get(end) == Some(&b'.') {
-			let fraction_length = bytes[end + 1..]
-				.iter()
-				.take_while(|byte| byte.is_ascii_digit())
-				.count();
-
-			if fraction_length == 0 {
-				return None;
-			}
-
-			end += 1 + fraction_length;
-		}
-
-		// At most 18 digits, so an int cannot overflow. A character that may continue a number, such as `e`, `_`, or `:`, needs the general path.
-		if end - integer_start > 18 || bytes.get(end).is_some_and(|&byte| !can_follow_value(byte)) {
-			return None;
-		}
-
-		let text = &self.source[start..end];
-
-		if end > integer_end {
-			let value: f64 = text.parse().ok()?;
-
-			// Negative zero is the same value as zero.
-			return Some((Kind::Float(if value == 0.0 { 0.0 } else { value }), end));
-		}
-
-		// `-0` is an error, which the general path reports.
-		if text == "-0" {
-			return None;
-		}
-
-		Some((Kind::Int(text.parse().ok()?), end))
-	}
-
-	/**
 	Whether the keyword is here, as a whole word, and if so, moves past it. A longer word, such as `nullable`, is not the keyword.
 	*/
 	fn eat_keyword(&mut self, word: &str) -> bool {
@@ -1383,11 +1513,7 @@ impl<'de> Parser<'de> {
 			_ => {}
 		}
 
-		let word_end = start
-			+ self.bytes[start..]
-				.iter()
-				.take_while(|&&byte| is_bare_key_byte(byte))
-				.count();
+		let word_end = bare_key_end(self.bytes, start);
 
 		if word_end > start {
 			let word = &self.source[start..word_end];
@@ -1470,11 +1596,7 @@ impl<'de> Parser<'de> {
 			return Ok(());
 		};
 		let inner = inner.strip_prefix(b"[").unwrap_or(inner);
-		let name_length = inner
-			.iter()
-			.take_while(|&&byte| is_bare_key_byte(byte))
-			.count();
-		let (name, closing) = inner.split_at(name_length);
+		let (name, closing) = inner.split_at(bare_key_end(inner, 0));
 
 		// The name is a valid key, so that the suggestion is valid.
 		let is_name = name
@@ -1532,7 +1654,7 @@ impl<'de> Parser<'de> {
 A collection written with brackets.
 */
 #[derive(Clone, Copy)]
-enum Collection {
+pub(crate) enum Collection {
 	Object,
 	Array,
 }
@@ -1563,10 +1685,66 @@ impl Collection {
 Whether a byte may directly follow a scalar: whitespace, a separator, a closing bracket, a comment, or the end.
 */
 const fn can_follow_value(byte: u8) -> bool {
+	// Any `/` passes, because it may start a `/*` comment. The separator check after the value reports any other `/`, with a hint for a `//` comment.
 	matches!(
 		byte,
 		b' ' | b'\t' | b'\n' | b',' | b']' | b'}' | b'#' | b'/'
 	)
+}
+
+/**
+Whether a value ends at `index`, so that a suggestion that ends there leaves nothing out. A `/` only starts a comment with a `*` after it, or a `//` comment of another language, which the error for what follows names, so in `km/h` the text goes on.
+*/
+fn is_value_end_at(bytes: &[u8], index: usize) -> bool {
+	match bytes.get(index) {
+		None => true,
+		Some(b'/') => matches!(bytes.get(index + 1), Some(b'*' | b'/')),
+		Some(&byte) => can_follow_value(byte),
+	}
+}
+
+/**
+The index after the spaces, tabs, line feeds, and comments at `index`, and whether they cross a line break. A line break inside a block comment does not count.
+*/
+#[inline]
+pub(crate) fn skip_trivia(bytes: &[u8], mut index: usize) -> Result<(usize, bool)> {
+	let mut has_line_break = false;
+
+	// There is no `\r` to skip, because `check_characters` rejects it before any parse.
+	loop {
+		match bytes.get(index) {
+			Some(b' ' | b'\t') => index += 1,
+			Some(b'\n') => {
+				has_line_break = true;
+				index += 1;
+			}
+			// The comment ends before its line feed, so the next pass counts the line break.
+			Some(b'#') => index = scalar::line_end(bytes, index),
+			Some(b'/') if bytes.get(index + 1) == Some(&b'*') => {
+				index = skip_block_comment(bytes, index)?;
+			}
+			_ => return Ok((index, has_line_break)),
+		}
+	}
+}
+
+/**
+The index after the block comment that starts at `start`.
+*/
+fn skip_block_comment(bytes: &[u8], start: usize) -> Result<usize> {
+	let Some(end) = block_comment_end(bytes, start) else {
+		return Err(ScalarError::new("Unterminated block comment", start));
+	};
+
+	// The body may not contain `/*`. An opening that overlaps the closing `*/`, as in `/*/`, is not inside the body.
+	if let Some(nested) = find(&bytes[start + 2..end], b"/*") {
+		return Err(ScalarError::new(
+			"Block comments cannot be nested, and their body may not contain “/*”",
+			start + 2 + nested,
+		));
+	}
+
+	Ok(end + 2)
 }
 
 /**
@@ -1581,19 +1759,6 @@ fn find(haystack: &[u8], needle: &[u8; 2]) -> Option<usize> {
 }
 
 /**
-The index after the spaces and tabs from `index`.
-*/
-fn skip_spaces(bytes: &[u8], index: usize) -> usize {
-	index
-		+ bytes
-			.get(index..)
-			.unwrap_or_default()
-			.iter()
-			.take_while(|byte| matches!(byte, b' ' | b'\t'))
-			.count()
-}
-
-/**
 The index after the last byte before `index` that is not a space or a tab.
 */
 fn skip_spaces_back(bytes: &[u8], index: usize) -> usize {
@@ -1603,16 +1768,6 @@ fn skip_spaces_back(bytes: &[u8], index: usize) -> usize {
 			.rev()
 			.take_while(|byte| matches!(byte, b' ' | b'\t'))
 			.count()
-}
-
-/**
-The index where the line that `index` is on starts.
-*/
-fn line_start(bytes: &[u8], index: usize) -> usize {
-	bytes[..index]
-		.iter()
-		.rposition(|&byte| byte == b'\n')
-		.map_or(0, |position| position + 1)
 }
 
 /**

@@ -4,7 +4,7 @@ The formatter in the spec's "Formatting" section. Its rules and the decisions th
 
 use super::{
 	Decor, DecorPart, Entry, Member, Node, Object, Scalar, decor_parts, ends_in_line_comment,
-	has_line_feed, indentation_of,
+	has_line_feed, indentation_of, shares_line_with_next,
 };
 
 /**
@@ -49,6 +49,7 @@ impl Gap {
 		for (part, range) in decor_parts(decor) {
 			match part {
 				DecorPart::LineComment => {
+					// A line comment runs up to the line feed, so it includes the spaces and tabs at the end of its line. These are removed.
 					current.push(decor[range].trim_end_matches([' ', '\t']).to_owned())
 				}
 				DecorPart::BlockComment => {
@@ -94,6 +95,15 @@ impl Gap {
 	*/
 	fn lines_after_opening(&self) -> &[Option<Vec<String>>] {
 		self.lines.strip_prefix(&[None]).unwrap_or(&self.lines)
+	}
+
+	/**
+	Whether the gap has a comment. A comment line, which is `Some`, always holds at least one.
+	*/
+	fn has_comments(&self) -> bool {
+		!self.end_of_line.is_empty()
+			|| self.lines.iter().any(Option::is_some)
+			|| !self.inline.is_empty()
 	}
 
 	/**
@@ -181,6 +191,7 @@ impl Formatter {
 	}
 
 	fn end_line(&mut self) {
+		// An empty line gets no indentation, so a blank line has no trailing tabs.
 		if !self.line.is_empty() {
 			self.output
 				.extend(std::iter::repeat_n('\t', self.indentation));
@@ -279,7 +290,7 @@ impl Formatter {
 	}
 
 	fn member(&mut self, member: &Member, indentation: usize) {
-		self.push(&member.key.to_string(), indentation);
+		self.push(&member.key.text(), indentation);
 		self.line.push(':');
 
 		// A value on the line after its `key:` moves up to that line, unless a comment comes between them. Then each comment keeps its line, and the value goes on a line of its own, one level deeper. Blank lines between them go.
@@ -287,7 +298,7 @@ impl Formatter {
 		let is_block_string =
 			matches!(&member.value, Node::Scalar(scalar) if scalar.is_block_string());
 
-		if has_line_feed(&member.after_colon) && !gap.all().is_empty() {
+		if has_line_feed(&member.after_colon) && gap.has_comments() {
 			self.comments(&gap.end_of_line, indentation + 1);
 			self.end_line();
 			let lines: Vec<_> = gap.lines.into_iter().filter(Option::is_some).collect();
@@ -304,24 +315,27 @@ impl Formatter {
 			} else {
 				self.comments_before(&gap.inline, indentation + 1);
 			}
-		} else if is_block_string {
-			// A block string begins on the line after its key, one level deeper, so its delimiters and content line up.
-			self.comments(&gap.all(), indentation + 1);
-			self.end_line();
-			self.start_line(indentation + 1);
 		} else {
 			// Without a line feed, every comment is on the key's line, also those before a block comment that spans lines.
 			self.comments(&gap.all(), indentation + 1);
-			self.line.push(' ');
+
+			if is_block_string {
+				// A block string begins on the line after its key, one level deeper, so its delimiters and content line up.
+				self.end_line();
+				self.start_line(indentation + 1);
+			} else {
+				self.line.push(' ');
+			}
 		}
 
+		// The value starts on the current line, which is one level deeper than the key's line when the value moved to a new line.
 		self.node(&member.value, self.indentation);
 	}
 
 	fn scalar(&mut self, scalar: &Scalar, indentation: usize) {
-		let mut text = String::new();
-		scalar.write_to(&mut text);
+		let text = scalar.text();
 
+		// Only a block string has a line feed in its text: a parsed `'...'` or `"..."` string ends on the line it starts on, and an added or replaced string is written with escapes.
 		let Some((opening, rest)) = text.split_once('\n') else {
 			self.push(&text, indentation);
 			return;
@@ -506,8 +520,7 @@ impl Formatter {
 			// The line break that the printer adds in changed decor: after a line comment at its end, before whatever follows, and between members whose decor has none, as after a member added through the node API.
 			let ends_line_comment =
 				ends_in_line_comment(trailing) && (next.is_some() || !after.is_empty());
-			let separates_members =
-				next.is_some() && !(has_line_feed(trailing) || has_line_feed(after));
+			let separates_members = shares_line_with_next(&object.members, index);
 			let line_break = if !after.starts_with('\n') && (ends_line_comment || separates_members)
 			{
 				"\n"

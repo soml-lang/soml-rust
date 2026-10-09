@@ -1367,6 +1367,26 @@ fn rejects_raw_control_characters_even_in_strings_and_comments() {
 }
 
 #[test]
+fn rejects_the_first_raw_control_character_at_any_offset_of_a_long_document() {
+	let comment = "x".repeat(100);
+
+	for offset in 0..comment.len() {
+		let mut text = format!("a: 1 # {comment}");
+		let column = "a: 1 # ".len() + offset + 1;
+		text.replace_range(column - 1..column, "\u{7}");
+		// A later one is not the one reported.
+		text.push('\u{0}');
+
+		assert_eq!(
+			rejection(&text),
+			format!(
+				"A raw control character (U+0007) is not allowed anywhere, including in strings and comments. In a string, write it as the escape \\u{{7}} inside \"...\" at line 1, column {column}"
+			)
+		);
+	}
+}
+
+#[test]
 fn every_control_character_but_cr_is_representable_as_an_escape() {
 	for code in (0u32..0x20).chain([0x7F]).filter(|code| *code != 0x0D) {
 		let character = char::from_u32(code).expect("a control character is a scalar value");

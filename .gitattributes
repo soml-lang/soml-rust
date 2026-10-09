@@ -1,3 +1,4 @@
 * text=auto eol=lf
 # The conformance cases test exact bytes, including CR and invalid UTF-8, so Git must not convert them.
 tests/conformance/** -text linguist-vendored
+bench/fixtures/** -text linguist-vendored

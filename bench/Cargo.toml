@@ -1,0 +1,19 @@
+[package]
+name = "soml-lang-bench"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+soml-lang = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+# soml-lang reads every float exactly, so serde_json must too, for the comparison to be fair.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+toml = "1"
+toml_edit = "0.25"
+# The ISO 8601 durations of JSON and TOML, and the instants of JSON, read as a user of those formats reads them.
+jiff = { version = "0.2.37", default-features = false, features = ["serde", "std"] }
+
+[profile.release]
+# Symbols for `xctrace` and other profilers.
+debug = true

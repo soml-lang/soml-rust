@@ -79,12 +79,12 @@ A map is written in the order it iterates in. A `HashMap` iterates in a differen
 | a struct, `HashMap`, `BTreeMap` | object. A map key can also be a char, an integer, a bool, or a unit enum variant. |
 | an enum | a string for a unit variant, and a one-member object for the others |
 | [`Instant`] | instant |
-| [`Duration`], `std::time::Duration` | duration. A negative duration does not fit a `std::time::Duration`. |
+| [`Duration`], `std::time::Duration` | duration. A negative duration does not fit a `std::time::Duration`. serde gives a `std::time::Duration` no type of its own, so it is recognized by its shape: a struct named `Duration` with the fields `secs` and `nanos`. A struct of your own with that shape is written as a duration too, and it reads back. |
 | [`Value`] | any value |
 
-Fields of jiff, chrono, and humantime types, such as `jiff::Timestamp`, `jiff::SignedDuration`, and `chrono::DateTime<Utc>`, read instants and durations too, because they ask for text, and an instant or a duration gives its canonical text. The cost of this is that a `String` field also accepts an instant or a duration. `chrono::TimeDelta` does not ask for text, so it needs `soml::chrono::time_delta` to read a duration too. Those types write themselves as strings, so use [`Instant`] and [`Duration`] to write native instants and durations.
+Fields of jiff, chrono, and humantime types, such as `jiff::Timestamp`, `jiff::SignedDuration`, and `chrono::DateTime<Utc>`, read instants and durations too, because they ask for text, and an instant or a duration gives its canonical text. humantime reads only instants from 1970 on. The cost of this is that a `String` field also accepts an instant or a duration. `chrono::TimeDelta` does not ask for text, so it needs `soml::chrono::time_delta` to read a duration too. Those types write themselves as strings, so use [`Instant`] and [`Duration`] to write native instants and durations.
 
-`#[serde(flatten)]`, untagged enums, internally tagged enums, and adjacently tagged enums whose content member comes before the tag member read values through serde's buffer, which has no instant or duration type and no positions. [`to_string`] writes the tag first, but [`to_string_canonical`] puts the content first when its key sorts first, as with `#[serde(tag = "t", content = "c")]`. There, an instant or a duration is its text: a [`Value`] holds it as a string, [`Instant`] and [`Duration`] still read it, and a `std::time::Duration` cannot be read. An int reads into a float even when the float does not hold it exactly, and a [`Spanned`] value has no span.
+`#[serde(flatten)]`, untagged enums, and internally tagged enums read values through serde's buffer, which has no instant or duration type and no positions. There, an instant or a duration is its text: a [`Value`] holds it as a string, [`Instant`] and [`Duration`] still read it, and a `std::time::Duration` cannot be read. An int reads into a float even when the float does not hold it exactly. An `f32` is read through an `f64`, as in `serde_json`, so 2 of the 4.3 billion `f32` values read back one step away. A [`Spanned`] value has no span.
 
 # Syntax tree
 
@@ -240,18 +240,20 @@ A `'...'` or `"..."` string without escapes is borrowed from `text`, so `T` can 
 
 # Errors
 
-Returns an error when `text` is not a valid document, or when the document does not fit `T`. The error has the line and column of the problem.
+Returns an error when `text` is not a valid document, or when the document does not fit `T`. The error has the line and column of the problem. To find the error that comes first, such a document is read a second time, so `T`'s `Deserialize` impl runs twice for it.
 */
 pub fn from_str<'de, T: Deserialize<'de>>(text: &'de str) -> Result<T, Error> {
-	let node = parse::parse(text)?;
-	// An error that a type makes after reading, such as a check in `#[serde(try_from)]`, is about the whole document.
-	let offset = node.offset;
+	// Most documents are valid and fit their type, so they are read in one pass, without a tree. After any error, the document is read again through the tree, which gives the error that a check of the whole document gives first.
+	if let Some(value) = de::stream::read(text) {
+		return Ok(value);
+	}
 
-	T::deserialize(de::NodeDeserializer {
-		node,
+	// An error that a type makes after reading, such as a check in `#[serde(try_from)]`, is about the whole document.
+	de::NodeDeserializer {
+		node: parse::parse(text)?,
 		source: Some(text),
-	})
-	.map_err(|error| error.or_at(Some(text), offset.get()))
+	}
+	.located(T::deserialize)
 }
 
 /**
@@ -306,6 +308,8 @@ assert_eq!(server.port, 8080);
 
 Returns an error when the value does not fit `T`. The error has no position, because a `Value` does not remember where it came from.
 
+A `Value` holds a float as an `f64`, so an `f32` is read through the `f64`'s shortest digits. For a document's text with more than 15 significant digits, that can be the `f32` next to the one [`from_str`] gives, which rounds the text itself.
+
 A `Value` from a document is never nested more than 100 levels deep. One built by hand that is nested thousands of levels deep can overflow the stack here.
 */
 pub fn from_value<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
@@ -332,10 +336,14 @@ assert_eq!(text, "name: 'soml'\ndescription: 'A config format'\n");
 
 # Errors
 
-Returns an error when the value is not an object or an array, because a document is always a collection, or when it holds something SOML cannot represent: NaN, an integer outside the 64-bit range, a carriage return in a string or a key, two members with the same key, a map key that is not a string, a char, a bool, an integer, or a unit enum variant, or nesting deeper than 100 levels.
+Returns an error when the value is not an object or an array, because a document is always a collection, or when it holds something SOML cannot represent: NaN, an integer outside the 64-bit range, a carriage return in a string or a key, two members with the same key, a map key that is not a string, a char, a bool, an integer, or a unit enum variant, or nesting deeper than 100 levels. To give the same error as [`to_string_canonical`], such a value is serialized a second time, so its `Serialize` impl runs twice for it. That is also the case for a `Serialize` impl that catches an error and goes on.
 */
 pub fn to_string<T: ?Sized + Serialize>(value: &T) -> Result<String, Error> {
-	write::document(&value.serialize(ser::NodeSerializer { depth: 0 })?, false)
+	// Writing the text as the value is serialized is faster than building a tree first. When that fails, or a type caught an error, the tree serializer writes the value, because the stream finds errors in another order, so its error can be a different one, and it keeps the text that was written before an error.
+	match ser::stream::write(value) {
+		Some(text) => Ok(text),
+		None => write::document(&value.serialize(ser::NodeSerializer { depth: 0 })?),
+	}
 }
 
 /**
@@ -358,7 +366,9 @@ assert_eq!(text, "description: 'A config format'\nname: 'soml'\n");
 Returns the errors of [`to_string`].
 */
 pub fn to_string_canonical<T: ?Sized + Serialize>(value: &T) -> Result<String, Error> {
-	write::document(&value.serialize(ser::NodeSerializer { depth: 0 })?, true)
+	let mut node = value.serialize(ser::NodeSerializer { depth: 0 })?;
+	node.sort_members();
+	write::document(&node)
 }
 
 /**

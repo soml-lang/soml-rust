@@ -29,9 +29,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-features
+  # The benchmark is not part of the package, so nothing else builds it. A run also checks that each fixture still reads, and that the JSON and TOML of each fixture with a struct hold the same data.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench
+      - run: cargo run --release --locked --manifest-path bench/Cargo.toml
   # A short run of every fuzz target, which finds what the tests do not try. The corpus folder is not in Git, so each target starts from the conformance cases.
   fuzz:
     runs-on: ubuntu-latest
@@ -44,10 +54,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
+      # The prebuilt cargo-fuzz is a musl binary, and it builds for its own target unless told otherwise, which the sanitizer does not support.
       - name: Fuzz each target for 60 seconds
         run: |
           for target in read document change format; do
             mkdir -p "fuzz/corpus/$target"
             find tests/conformance -name '*.soml' -exec cp {} "fuzz/corpus/$target/" \;
-            cargo fuzz run "$target" -- -max_total_time=60 -max_len=4096
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -max_len=4096
           done

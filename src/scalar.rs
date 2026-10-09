@@ -1,21 +1,11 @@
 /*!
-Reading one token: numbers, instants, durations, and strings. Both the parser and the syntax tree use these functions, so the two cannot disagree about a value.
+Reading one token: numbers, instants, durations, and strings. The parser reads every value with these functions, and the syntax tree takes its values from the parser's tree, so the two cannot disagree about a value.
 */
 
+use crate::parse::Kind;
 use crate::tree::Radix;
 use crate::{Duration, Instant, abbreviate};
 use std::borrow::Cow;
-
-/**
-A scalar that a number-like token holds.
-*/
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Scalar {
-	Int(i64),
-	Float(f64),
-	Instant(Instant),
-	Duration(Duration),
-}
 
 /**
 An error at a byte offset in the source.
@@ -40,7 +30,21 @@ impl ScalarError {
 Letters, digits, `_`, and `-`: the characters of a bare key.
 */
 pub(crate) const fn is_bare_key_byte(byte: u8) -> bool {
-	byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+	// A table, which is one lookup for the many bytes of keys and numbers, rather than several comparisons.
+	const TABLE: [bool; 256] = {
+		let mut table = [false; 256];
+		let mut index = 0;
+
+		while index < table.len() {
+			let byte = index as u8;
+			table[index] = byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-';
+			index += 1;
+		}
+
+		table
+	};
+
+	TABLE[byte as usize]
 }
 
 /**
@@ -51,13 +55,44 @@ pub(crate) fn is_bare_key(key: &str) -> bool {
 }
 
 /**
+The index after the letters, digits, `_`, and `-` from `start`, which is the end of a bare key that starts there.
+*/
+pub(crate) fn bare_key_end(bytes: &[u8], start: usize) -> usize {
+	start
+		+ bytes[start..]
+			.iter()
+			.take_while(|&&byte| is_bare_key_byte(byte))
+			.count()
+}
+
+/**
+The index after the spaces and tabs from `index`.
+*/
+pub(crate) fn skip_spaces(bytes: &[u8], index: usize) -> usize {
+	index
+		+ bytes
+			.get(index..)
+			.unwrap_or_default()
+			.iter()
+			.take_while(|byte| matches!(byte, b' ' | b'\t'))
+			.count()
+}
+
+/**
+The index where the line that `index` is on starts.
+*/
+pub(crate) fn line_start(bytes: &[u8], index: usize) -> usize {
+	bytes[..index]
+		.iter()
+		.rposition(|&byte| byte == b'\n')
+		.map_or(0, |position| position + 1)
+}
+
+/**
 The index of the line feed that ends the line `from` is on, or the length of `bytes` on the last line.
 */
 pub(crate) fn line_end(bytes: &[u8], from: usize) -> usize {
-	bytes[from..]
-		.iter()
-		.position(|&byte| byte == b'\n')
-		.map_or(bytes.len(), |length| from + length)
+	find_any(&bytes[from..], *b"\n").map_or(bytes.len(), |length| from + length)
 }
 
 /**
@@ -125,6 +160,7 @@ enum NumberKind {
 Whether `text` is a decimal int, a radix int, or a float, following the grammar.
 */
 fn classify_number(text: &[u8]) -> Option<NumberKind> {
+	// A radix prefix is only read at the start, so a signed radix int, such as `-0x1`, is not a number here, and `describe_bad_number` reports the sign.
 	if text.first() == Some(&b'0') {
 		let radix = match text.get(1) {
 			Some(b'x') => Some((Radix::Hexadecimal, is_hexadecimal_digit as fn(&u8) -> bool)),
@@ -183,7 +219,7 @@ fn classify_number(text: &[u8]) -> Option<NumberKind> {
 }
 
 /**
-Whether a token that is not a number or an instant was meant as a duration: its first letter could begin a unit, or a day or a week. A radix prefix, an exponent, and other letters, such as the `T` in `20260919T140000Z` or the `x` in `1.5x`, are left to the number errors.
+Whether a token that is not a number or an instant was meant as a duration: its first letter could begin a unit, or a day or a week, or it is a year unit. A radix prefix, an exponent, and other letters, such as the `T` in `20260919T140000Z` or the `x` in `1.5x`, are left to the number errors.
 */
 fn is_duration_like(text: &[u8]) -> bool {
 	let start = usize::from(text.first() == Some(&b'-'));
@@ -210,12 +246,24 @@ fn is_duration_like(text: &[u8]) -> bool {
 		}
 	}
 
-	text.get(index).is_some_and(|byte| {
+	if text.get(index).is_some_and(|byte| {
 		matches!(
 			byte.to_ascii_lowercase(),
 			b'd' | b'h' | b'm' | b'n' | b's' | b'u' | b'w'
 		)
-	})
+	}) {
+		return true;
+	}
+
+	// A year unit, as in `1y` or `2years`, is only one when the token or another part follows it, so that a word such as `100yen` stays a string to quote.
+	let unit_end = index
+		+ text[index..]
+			.iter()
+			.take_while(|byte| byte.is_ascii_alphabetic())
+			.count();
+
+	crate::duration::is_year_unit(&text[index..unit_end])
+		&& text.get(unit_end).is_none_or(u8::is_ascii_digit)
 }
 
 /**
@@ -243,17 +291,21 @@ pub(crate) fn has_date_prefix(text: &[u8]) -> bool {
 /**
 Reads a number, an instant, or a duration from a whole token. The error is the reason the token is invalid, which the caller reports at the token's start. `None` when the token is no number, instant, or duration at all, which the caller describes with `describe_bad_number`, because the description depends on the text after the token.
 */
-pub(crate) fn token_value(text: &str) -> Option<Result<Scalar, String>> {
+pub(crate) fn token_value(text: &str) -> Option<Result<Kind<'static>, String>> {
+	if let Some(kind) = plain_number(text) {
+		return Some(Ok(kind));
+	}
+
 	let bytes = text.as_bytes();
 
 	if has_date_prefix(bytes) {
-		return Some(Instant::parse(text).map(Scalar::Instant));
+		return Some(Instant::parse(text).map(Kind::Instant));
 	}
 
 	let kind = classify_number(bytes);
 
 	match kind {
-		None if is_duration_like(bytes) => Some(Duration::parse(text).map(Scalar::Duration)),
+		None if is_duration_like(bytes) => Some(Duration::parse(text).map(Kind::Duration)),
 		Some(NumberKind::Int(radix)) => {
 			if text == "-0" {
 				return Some(Err(
@@ -261,10 +313,53 @@ pub(crate) fn token_value(text: &str) -> Option<Result<Scalar, String>> {
 				));
 			}
 
-			Some(integer(text, radix).map(Scalar::Int))
+			Some(integer(text, radix).map(Kind::Int))
 		}
-		Some(NumberKind::Float) => Some(float(text).map(Scalar::Float)),
+		Some(NumberKind::Float) => Some(float(text).map(Kind::Float)),
 		None => None,
+	}
+}
+
+/**
+The common case of a short decimal int or float, such as `8080`, `-3`, or `30.5`, without the general path's checks. Anything else, including every error, returns `None` and is left to the general path.
+*/
+fn plain_number(text: &str) -> Option<Kind<'static>> {
+	let bytes = text.as_bytes();
+	let integer = bytes.strip_prefix(b"-").unwrap_or(bytes);
+	let integer_length = integer
+		.iter()
+		.take_while(|byte| byte.is_ascii_digit())
+		.count();
+
+	// No digits, or a leading zero, which is either `0` alone or an error.
+	if integer_length == 0 || (integer_length > 1 && integer[0] == b'0') {
+		return None;
+	}
+
+	// At most 18 digits, so an int cannot overflow.
+	if integer.len() > 18 {
+		return None;
+	}
+
+	match &integer[integer_length..] {
+		[] => {
+			// `-0` is an error, which the general path reports.
+			if text == "-0" {
+				return None;
+			}
+
+			Some(Kind::Int(text.parse().ok()?))
+		}
+		[b'.', fraction @ ..]
+			if !fraction.is_empty() && fraction.iter().all(u8::is_ascii_digit) =>
+		{
+			let value: f64 = text.parse().ok()?;
+
+			// Negative zero is the same value as zero.
+			Some(Kind::Float(if value == 0.0 { 0.0 } else { value }))
+		}
+		// A character that may continue a number, such as `e`, `_`, or `:`, needs the general path.
+		_ => None,
 	}
 }
 
@@ -281,6 +376,7 @@ fn integer(text: &str, radix: Radix) -> Result<i64, String> {
 		(Radix::Decimal, None) => (text, false),
 		_ => (&text[2..], false),
 	};
+	// The discriminant of each `Radix` is its base.
 	let radix = radix as u32;
 
 	// Accumulated as the magnitude, so that the most negative value, whose magnitude is one more than the largest positive value, is read too.
@@ -446,16 +542,25 @@ pub(crate) fn describe_bad_number(full_text: &str, unquoted_text: &str) -> Strin
 		};
 	}
 
-	// `-?\d[\d_]*E` or `-?\d[\d_]*\.[\d_]+E`.
+	// `-?\d[\d_]*(\.[\d_]+)?E-?[\d_]*`, the whole text. Only when the “E” is where an exponent marker goes, with digits, a `-`, or nothing after it. In `5EUR` or `10EB`, it is part of a word, so lowercasing it would not help.
 	if let Some(end) = leading_digit_run {
 		let fraction_end = if text.get(end) == Some(&b'.') {
 			digit_run_end(end + 1)
 		} else {
 			end
 		};
+		let marker = if fraction_end > end + 1 {
+			fraction_end
+		} else {
+			end
+		};
 
-		if text.get(end) == Some(&b'E')
-			|| (fraction_end > end + 1 && text.get(fraction_end) == Some(&b'E'))
+		if let [b'E', exponent @ ..] = &text[marker..]
+			&& exponent
+				.strip_prefix(b"-")
+				.unwrap_or(exponent)
+				.iter()
+				.all(|byte| byte.is_ascii_digit() || *byte == b'_')
 		{
 			return "An exponent marker is a lowercase “e”".to_owned();
 		}
@@ -478,14 +583,13 @@ pub(crate) fn describe_bad_number(full_text: &str, unquoted_text: &str) -> Strin
 	}
 
 	// Digits with a `:` between them, such as a time of day.
-	if text.first().is_some_and(u8::is_ascii_digit)
-		&& text.last().is_some_and(u8::is_ascii_digit)
-		&& text.contains(&b':')
-		&& text
-			.split(|&byte| byte == b':')
+	let parts: Vec<&[u8]> = text.split(|&byte| byte == b':').collect();
+
+	if parts.len() > 1
+		&& parts
+			.iter()
 			.all(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
 	{
-		let parts: Vec<&[u8]> = text.split(|&byte| byte == b':').collect();
 		let is_time_of_day = matches!(parts.len(), 2 | 3)
 			&& matches!(parts[0].len(), 1 | 2)
 			&& parts[1..].iter().all(|part| part.len() == 2);
@@ -500,7 +604,10 @@ pub(crate) fn describe_bad_number(full_text: &str, unquoted_text: &str) -> Strin
 		);
 	}
 
-	if let [b'0', b'0'..=b'9' | b'_', ..] = unsigned {
+	// A value with a `:` that starts with a zero, such as the MAC address `00:1A:2B`, is not a number with a leading zero, because removing the zero would not make it valid.
+	if let [b'0', b'0'..=b'9' | b'_', ..] = unsigned
+		&& !text.contains(&b':')
+	{
 		// Removing the zero gives a valid number with another meaning, so the message says what the zero usually meant.
 		let message = "Leading zeros are not allowed in a decimal number";
 
@@ -534,7 +641,7 @@ pub(crate) fn describe_bad_number(full_text: &str, unquoted_text: &str) -> Strin
 		return format!("{message}. Write {identifier}");
 	}
 
-	// An underscore at either end, or next to something other than a digit.
+	// An underscore at either end, or next to something other than a digit. Only in a number: an underscore next to a letter other than the exponent marker is part of a word, such as `4k_video`.
 	let has_bad_underscore = text.iter().enumerate().any(|(index, byte)| {
 		*byte == b'_'
 			&& (index == 0
@@ -543,7 +650,11 @@ pub(crate) fn describe_bad_number(full_text: &str, unquoted_text: &str) -> Strin
 				|| !text[index + 1].is_ascii_digit())
 	});
 
-	if has_bad_underscore {
+	if has_bad_underscore
+		&& text
+			.iter()
+			.all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'_' | b'e'))
+	{
 		return "An underscore in a number must be between two digits".to_owned();
 	}
 
@@ -567,11 +678,12 @@ pub(crate) fn describe_bad_number(full_text: &str, unquoted_text: &str) -> Strin
 				return "“e-0” is not allowed, because an exponent of zero has one spelling: e0"
 					.to_owned();
 			}
-		}
-	}
 
-	if text.ends_with(b"e") || text.ends_with(b"e-") {
-		return "Expected digits after the exponent marker “e”".to_owned();
+			// Only a number ends with its exponent marker. A word that ends with an “e”, such as `1byte` or `-verbose`, has no exponent.
+			if matches!(exponent, b"" | b"-") {
+				return "Expected digits after the exponent marker “e”".to_owned();
+			}
+		}
 	}
 
 	if text.iter().filter(|&&byte| byte == b'.').count() > 1 {
@@ -584,11 +696,12 @@ pub(crate) fn describe_bad_number(full_text: &str, unquoted_text: &str) -> Strin
 	if text.first() == Some(&b'-') && !text.get(1).is_some_and(u8::is_ascii_digit) {
 		let rest = text[1..].to_ascii_lowercase();
 
-		if rest.starts_with(b"nan") {
+		// The whole word, as for one without the “-”, so that a word such as `-nano` or `-info` is not taken for NaN or infinity.
+		if rest == b"nan" {
 			return "NaN is not representable. Use null for a missing value".to_owned();
 		}
 
-		if rest.starts_with(b"inf") {
+		if rest == b"inf" || rest == b"infinity" {
 			return format!(
 				"“{}” is not a value. Negative infinity is written -infinity",
 				abbreviate(full_text, 40)
@@ -646,6 +759,7 @@ pub(crate) fn describe_character(character: char) -> String {
 	let code = u32::from(character);
 
 	if let Some(name) = invisible_character_name(character) {
+		// U+200B and U+FEFF are not whitespace in Unicode, but they are zero-width spaces, so the note applies to them too.
 		let note = if character.is_whitespace() || matches!(code, 0x200B | 0xFEFF) {
 			"; only space, tab, and line feed are whitespace"
 		} else {
@@ -665,6 +779,7 @@ pub(crate) fn describe_character(character: char) -> String {
 Whether a character is invisible or ambiguous on screen, so an error message shows it by code point: a control, format, private-use, unassigned, separator, or default-ignorable character other than the space. These are the characters of `[\p{Default_Ignorable_Code_Point}\p{Other}\p{Separator}]`, which the JS reference implementation uses.
 */
 pub(crate) fn is_invisible(character: char) -> bool {
+	// An odd count of boundaries at or below the character means that the last of them starts a range, so the character is in that range.
 	INVISIBLE_RANGES.partition_point(|&boundary| boundary <= u32::from(character)) % 2 == 1
 }
 
@@ -890,16 +1005,47 @@ pub(crate) fn string(source: &str, start: usize) -> Result<(Cow<'_, str>, usize)
 }
 
 /**
+The index of the first byte that is one of `targets`. It checks 8 bytes at a time in one machine word, as `serde_json` and `memchr` do, and the lowest marked byte of a word is the first match.
+*/
+#[inline]
+pub(crate) fn find_any<const N: usize>(bytes: &[u8], targets: [u8; N]) -> Option<usize> {
+	// All bytes of these masks are the same, so the byte order does not matter. The word itself must be little-endian, so that its first byte is the lowest.
+	const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+	const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+
+	let (words, remainder) = bytes.as_chunks::<8>();
+
+	for (word_index, word) in words.iter().enumerate() {
+		let word = u64::from_le_bytes(*word);
+		let mut found = 0;
+
+		// A byte of `difference` is zero where the word has the target, which sets the high bit of that byte. A borrow can mark a byte above a match too, but never one below it.
+		for target in targets {
+			let difference = word ^ (ONES * u64::from(target));
+			found |= difference.wrapping_sub(ONES) & !difference & HIGHS;
+		}
+
+		if found != 0 {
+			return Some(word_index * 8 + found.trailing_zeros() as usize / 8);
+		}
+	}
+
+	let remainder_start = bytes.len() - remainder.len();
+
+	remainder
+		.iter()
+		.position(|byte| targets.contains(byte))
+		.map(|position| remainder_start + position)
+}
+
+/**
 Reads a `'...'` string that starts at `start`. Returns its value, borrowed from the source, and the index after its closing quote.
 */
 pub(crate) fn literal_string(source: &str, start: usize) -> Result<(&str, usize), ScalarError> {
 	let bytes = source.as_bytes();
 
 	// Stops at the first quote or line break, so that a one-line document with many strings stays linear.
-	match bytes[start + 1..]
-		.iter()
-		.position(|&byte| byte == b'\'' || byte == b'\n')
-	{
+	match find_any(&bytes[start + 1..], *b"'\n") {
 		Some(length) if bytes[start + 1 + length] == b'\'' => {
 			Ok((&source[start + 1..start + 1 + length], start + 2 + length))
 		}
@@ -922,10 +1068,7 @@ pub(crate) fn escaped_string(
 	let mut value: Option<String> = None;
 
 	loop {
-		let Some(length) = bytes[chunk_start..]
-			.iter()
-			.position(|&byte| matches!(byte, b'"' | b'\\' | b'\n'))
-		else {
+		let Some(length) = find_any(&bytes[chunk_start..], *b"\"\\\n") else {
 			return Err(unterminated_escaped_string(start));
 		};
 
@@ -1016,7 +1159,9 @@ fn unicode_escape(source: &str, offset: usize, output: &mut String) -> Result<us
 		.get(digits_start..)
 		.unwrap_or_default()
 		.iter()
-		.take_while(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+		// Uppercase digits too, so that the value of such an escape is checked before its spelling.
+		.take_while(|byte| byte.is_ascii_hexdigit())
+		// One more than the six allowed, so that too many digits are found without a scan of all of them.
 		.take(7)
 		.count();
 
@@ -1034,7 +1179,7 @@ fn unicode_escape(source: &str, offset: usize, output: &mut String) -> Result<us
 	let hex = &source[digits_start..digits_start + length];
 	let code = u32::from_str_radix(hex, 16).expect("the digits are hexadecimal");
 
-	// The value is checked before the spelling, so that the leading zeros error never suggests an escape that is not allowed either.
+	// The value is checked before the spelling, so that the uppercase and leading zeros errors never point to an escape that is not allowed either.
 	if code == 0x0D {
 		return Err(ScalarError::new(
 			format!(
@@ -1058,6 +1203,13 @@ fn unicode_escape(source: &str, offset: usize, output: &mut String) -> Result<us
 		));
 	};
 
+	if hex.bytes().any(|byte| byte.is_ascii_uppercase()) {
+		return Err(ScalarError::new(
+			"A Unicode escape uses lowercase hexadecimal digits",
+			offset,
+		));
+	}
+
 	if length > 1 && hex.starts_with('0') {
 		return Err(ScalarError::new(
 			format!(
@@ -1076,6 +1228,7 @@ fn unicode_escape(source: &str, offset: usize, output: &mut String) -> Result<us
 Describes a malformed `\u` escape. `offset` is the `u`.
 */
 fn describe_bad_unicode_escape(source: &str, offset: usize) -> String {
+	// Long enough for the longest form that is read, a JSON surrogate pair such as `ud83d\ude00`. The slice is of bytes, so it may cut a character.
 	let rest = &source.as_bytes()[offset..source.len().min(offset + 12)];
 
 	if rest.len() >= 5 && rest[1..5].iter().all(u8::is_ascii_hexdigit) {
@@ -1201,11 +1354,7 @@ pub(crate) fn block_string(source: &str, start: usize) -> Result<(String, usize)
 
 		let line_start = index;
 		let line_end = line_end(bytes, line_start);
-		let content_start = line_start
-			+ bytes[line_start..line_end]
-				.iter()
-				.take_while(|&&byte| byte == b' ' || byte == b'\t')
-				.count();
+		let content_start = skip_spaces(bytes, line_start);
 		let run_length = bytes[content_start..]
 			.iter()
 			.take_while(|&&byte| byte == quote)
@@ -1305,6 +1454,7 @@ fn unescape_line(
 	while let Some(length) = text[chunk_start..].find('\\') {
 		let index = chunk_start + length;
 		output.push_str(&text[chunk_start..index]);
+		// `escape` takes a source offset, so that its errors point into the source. The index it returns is still inside `text`, because no escape continues past a line feed.
 		chunk_start = escape(source, offset + index, output)? - offset;
 	}
 

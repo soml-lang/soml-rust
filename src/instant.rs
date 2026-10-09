@@ -1,6 +1,6 @@
 use crate::Error;
 use crate::scalar::{MAX_DIAGNOSED_LENGTH, has_date_prefix};
-use serde_core::de::{self, Deserialize, Deserializer, Visitor};
+use serde_core::de::{Deserialize, Deserializer};
 use serde_core::ser::{Serialize, Serializer};
 use std::fmt::{self, Display, Write};
 use std::str::FromStr;
@@ -30,6 +30,7 @@ pub struct Instant {
 	nanoseconds: u32,
 }
 
+// The Unix seconds of 0001-01-01T00:00:00Z and of 9999-12-31T23:59:59Z.
 const MIN_SECONDS: i64 = -62_135_596_800;
 const MAX_SECONDS: i64 = 253_402_300_799;
 
@@ -89,6 +90,7 @@ impl Instant {
 	*/
 	#[must_use]
 	pub fn from_unix_nanoseconds(nanoseconds: i128) -> Option<Self> {
+		// Euclidean division keeps the nanoseconds from 0 to 999,999,999 for an instant before 1970, as `from_unix` requires, so the cast is lossless.
 		let seconds = i64::try_from(nanoseconds.div_euclid(1_000_000_000)).ok()?;
 		Self::from_unix(seconds, nanoseconds.rem_euclid(1_000_000_000) as u32)
 	}
@@ -122,7 +124,7 @@ impl Instant {
 	*/
 	pub(crate) fn parse(text: &str) -> Result<Self, String> {
 		let Some(parts) = Parts::scan(text) else {
-			return Err(describe_bad_instant(text, "", false));
+			return Err(describe_bad_instant(text, "", false, None));
 		};
 
 		let reason =
@@ -132,6 +134,7 @@ impl Instant {
 			return Err(reason("a fractional second has at most nine digits"));
 		}
 
+		// The year has four digits, so it cannot be more than 9999.
 		if parts.year == 0 {
 			return Err(reason("the year must be 0001 to 9999"));
 		}
@@ -189,6 +192,7 @@ impl Instant {
 
 		let mut nanoseconds = 0;
 
+		// The length check above keeps `index` at 8 or less, so the exponent does not underflow.
 		for (index, digit) in parts.fraction.bytes().enumerate() {
 			nanoseconds += u32::from(digit - b'0') * 10u32.pow(8 - index as u32);
 		}
@@ -236,6 +240,7 @@ impl<'a> Parts<'a> {
 	fn scan(text: &'a str) -> Option<Self> {
 		let bytes = text.as_bytes();
 
+		// The shortest instant, `YYYY-MM-DDTHH:MM:SSZ`, has 20 bytes, so the indexes up to 19 below are in bounds.
 		if bytes.len() < 20
 			|| bytes.len() > MAX_DIAGNOSED_LENGTH
 			|| bytes[4] != b'-'
@@ -302,28 +307,37 @@ fn digits(bytes: &[u8]) -> Option<u32> {
 }
 
 /**
-The reason `text` does not have the form of an instant, or `None` when it has that form, whatever its values. `time` is the token after a space that follows `text` in a document, or an empty string, and `is_whole_value` is whether nothing that may be part of the instant follows `text` there.
+The reason `text` does not have the form of an instant, or `None` when it has that form, whatever its values. `time` is the token after a space that follows `text` in a document, or an empty string, `is_whole_value` is whether nothing that may be part of the instant follows `text` there, and `offset` is an offset after a space that follows `text` there, or `None`.
 */
 pub(crate) fn describe_malformed_instant(
 	text: &str,
 	time: &str,
 	is_whole_value: bool,
+	offset: Option<&str>,
 ) -> Option<String> {
 	Parts::scan(text)
 		.is_none()
-		.then(|| describe_bad_instant(text, time, is_whole_value))
+		.then(|| describe_bad_instant(text, time, is_whole_value, offset))
 }
 
 const INSTANT_FORMAT: &str = "An instant is written as 2026-09-19T14:00:00Z, with an optional fraction of up to nine digits and an offset of Z or ±HH:MM";
 
-fn describe_bad_instant(text: &str, time: &str, is_whole_value: bool) -> String {
+fn describe_bad_instant(
+	text: &str,
+	time: &str,
+	is_whole_value: bool,
+	offset: Option<&str>,
+) -> String {
 	let bytes = text.as_bytes();
-
-	if text.len() > MAX_DIAGNOSED_LENGTH {
-		return format!(
+	let general = || {
+		format!(
 			"Invalid instant “{}”. {INSTANT_FORMAT}",
 			crate::abbreviate(text, 40)
-		);
+		)
+	};
+
+	if text.len() > MAX_DIAGNOSED_LENGTH {
+		return general();
 	}
 
 	if bytes.len() == 10 && has_date_prefix(bytes) {
@@ -355,10 +369,19 @@ fn describe_bad_instant(text: &str, time: &str, is_whole_value: bool) -> String 
 	}
 
 	if !is_local_date_time(bytes) {
-		return format!(
-			"Invalid instant “{}”. {INSTANT_FORMAT}",
-			crate::abbreviate(text, 40)
-		);
+		return general();
+	}
+
+	if let Some(offset) = offset {
+		// The instant has the offset it was meant in, so it is not a local time to write as a string.
+		let reason = "An instant's offset follows its time directly, without a space";
+		let instant = format!("{text}{offset}");
+
+		return if crate::parse::is_valid_value(&instant) {
+			format!("{reason}, as in {}", crate::abbreviate(&instant, 40))
+		} else {
+			reason.to_owned()
+		};
 	}
 
 	if is_whole_value {
@@ -395,6 +418,7 @@ A date alone, which is not an instant. The instant it could be is only shown whe
 */
 fn describe_date(date: &str) -> String {
 	let bytes = date.as_bytes();
+	// The caller checked `has_date_prefix`, so these are digits and the defaults are never used.
 	let (year, month, day) = (
 		digits(&bytes[0..4]).unwrap_or_default(),
 		digits(&bytes[5..7]).unwrap_or_default(),
@@ -458,12 +482,14 @@ const fn days_in_month(year: u32, month: u32) -> u32 {
 Days since 1970-01-01 in the proleptic Gregorian calendar. Howard Hinnant's `days_from_civil`.
 */
 const fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+	// The year starts on March 1 here, so that a leap day is the last day of its year.
 	let year = if month <= 2 { year - 1 } else { year };
 	let era = year.div_euclid(400);
 	let year_of_era = year - era * 400;
 	let month_from_march = (month as i64 + 9) % 12;
 	let day_of_year = (153 * month_from_march + 2) / 5 + day as i64 - 1;
 	let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+	// 719,468 is the number of days from 0000-03-01 to 1970-01-01.
 	era * 146_097 + day_of_era - 719_468
 }
 
@@ -494,12 +520,33 @@ Writes the canonical form: UTC with `Z`, and a fraction without trailing zeros, 
 impl Display for Instant {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let (year, month, day, hour, minute, second) = self.components();
-		write!(
-			formatter,
-			"{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
-		)?;
+		// The digits are put in place, because `write!` is several times slower, and a large document can have thousands of instants. Each field has a fixed width, and the year is from 1 to 9999.
+		let mut text = *b"0000-00-00T00:00:00";
+
+		for (end, width, value) in [
+			(4, 4, year as u32),
+			(7, 2, month),
+			(10, 2, day),
+			(13, 2, hour),
+			(16, 2, minute),
+			(19, 2, second),
+		] {
+			put_digits(&mut text[end - width..end], value);
+		}
+
+		formatter.write_str(std::str::from_utf8(&text).expect("the digits are ASCII"))?;
 		write_fraction(formatter, self.nanoseconds)?;
 		formatter.write_char('Z')
+	}
+}
+
+/**
+Writes `value` in decimal into all of `digits`, with leading zeros.
+*/
+fn put_digits(digits: &mut [u8], mut value: u32) {
+	for digit in digits.iter_mut().rev() {
+		*digit = b'0' + (value % 10) as u8;
+		value /= 10;
 	}
 }
 
@@ -511,15 +558,15 @@ pub(crate) fn write_fraction(output: &mut impl Write, nanoseconds: u32) -> fmt::
 		return Ok(());
 	}
 
-	let mut digits = nanoseconds;
-	let mut width = 9;
+	let mut text = *b".000000000";
+	put_digits(&mut text[1..], nanoseconds);
+	let end = text
+		.iter()
+		.rposition(|&byte| byte != b'0')
+		.expect("the nanoseconds are not zero")
+		+ 1;
 
-	while digits.is_multiple_of(10) {
-		digits /= 10;
-		width -= 1;
-	}
-
-	write!(output, ".{digits:0width$}")
+	output.write_str(std::str::from_utf8(&text[..end]).expect("the digits are ASCII"))
 }
 
 impl fmt::Debug for Instant {
@@ -561,6 +608,7 @@ impl TryFrom<SystemTime> for Instant {
 			Err(error) => {
 				let before = error.duration();
 				let nanoseconds = before.subsec_nanos();
+				// The nanoseconds of an `Instant` count forward from its second, so a fraction before 1970 borrows one second.
 				i64::try_from(before.as_secs()).ok().and_then(|seconds| {
 					if nanoseconds == 0 {
 						Self::from_unix(-seconds, 0)
@@ -588,6 +636,7 @@ impl TryFrom<Instant> for SystemTime {
 				instant.nanoseconds,
 			))
 		} else {
+			// The nanoseconds count forward from the whole second, so they are added after the seconds are subtracted.
 			UNIX_EPOCH
 				.checked_sub(StdDuration::from_secs(instant.seconds.unsigned_abs()))
 				.and_then(|time| {
@@ -611,27 +660,12 @@ impl Serialize for Instant {
 
 impl<'de> Deserialize<'de> for Instant {
 	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-		struct InstantVisitor;
-
-		impl<'de> Visitor<'de> for InstantVisitor {
-			type Value = Instant;
-
-			fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-				formatter.write_str("an instant")
-			}
-
-			fn visit_str<E: de::Error>(self, text: &str) -> Result<Instant, E> {
-				Instant::parse(text).map_err(E::custom)
-			}
-
-			fn visit_newtype_struct<D: Deserializer<'de>>(
-				self,
-				deserializer: D,
-			) -> Result<Instant, D::Error> {
-				deserializer.deserialize_str(self)
-			}
-		}
-
-		deserializer.deserialize_newtype_struct(TOKEN, InstantVisitor)
+		deserializer.deserialize_newtype_struct(
+			TOKEN,
+			crate::value::TextVisitor {
+				expecting: "an instant",
+				parse: Self::parse,
+			},
+		)
 	}
 }

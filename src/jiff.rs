@@ -47,6 +47,7 @@ impl TryFrom<Instant> for Timestamp {
 	Fails for an instant after `9999-12-30T22:00:00.999999999Z`, where jiff's range ends.
 	*/
 	fn try_from(instant: Instant) -> Result<Self, Error> {
+		// jiff adds the nanoseconds to the seconds whatever their signs, as `Instant` does, and nanoseconds below one billion always fit an `i32`.
 		Self::new(instant.unix_seconds(), instant.nanoseconds() as i32).map_err(|error| {
 			Error::data(format!(
 				"The instant {instant} is outside the range of a jiff timestamp: {error}"

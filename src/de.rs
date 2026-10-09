@@ -1,6 +1,8 @@
 /*!
-The deserializer. It reads from the parsed tree, in which every value and key has its offset, so an error says where in the document it is. `from_value` converts a `Value` into the same tree without offsets, so there is one deserializer for both.
+The deserializer. It reads from the parsed tree, in which every value and key has its offset, so an error says where in the document it is. `from_value` converts a `Value` into the same tree without offsets, so there is one deserializer for both. `from_str` first reads a document with the deserializer in `stream`, which does not build the whole tree, and which uses this one for each scalar.
 */
+
+pub(crate) mod stream;
 
 use crate::parse::{Kind, Member, Node, Object as NodeObject, Offset};
 use crate::{Error, Value};
@@ -11,6 +13,20 @@ use serde_core::de::{
 };
 use serde_core::forward_to_deserialize_any;
 use std::borrow::Cow;
+
+/**
+Narrows an `f64` to an `f32` through its shortest decimal, the text a document gives it, because rounding the `f64` again can give the `f32` next to the one that text names. It is exact for text with up to 15 significant digits, which includes every `f32` that is written, so `from_value` agrees with reading the document. A float read from a document is rounded once from its own text instead, which is exact for any number of digits.
+*/
+fn narrow(value: f64) -> f32 {
+	if !value.is_finite() {
+		return value as f32;
+	}
+
+	zmij::Buffer::new()
+		.format_finite(value)
+		.parse()
+		.expect("zmij writes a valid float")
+}
 
 pub(crate) struct NodeDeserializer<'de> {
 	pub node: Node<'de>,
@@ -38,7 +54,10 @@ impl<'de> NodeDeserializer<'de> {
 	/**
 	Runs a visit and gives an error without a position the position of this value.
 	*/
-	fn located<T>(self, visit: impl FnOnce(Self) -> Result<T, Error>) -> Result<T, Error> {
+	pub(crate) fn located<T>(
+		self,
+		visit: impl FnOnce(Self) -> Result<T, Error>,
+	) -> Result<T, Error> {
 		let source = self.source;
 		let offset = self.node.offset;
 		visit(self).map_err(|error| error.or_at(source, offset.get()))
@@ -59,6 +78,7 @@ impl<'de> NodeDeserializer<'de> {
 			Kind::String(Cow::Borrowed(value)) => visitor.visit_borrowed_str(value),
 			Kind::String(Cow::Owned(value)) => visitor.visit_string(value),
 			// serde has no instant or duration type, so these are given as their canonical text. That is what jiff, chrono, and humantime types read, and what `serde_json::Value` can hold.
+			// TODO: When serde lets a format choose its own buffer type (https://github.com/serde-rs/serde/pull/2912), buffer the `Node` itself, so that `#[serde(flatten)]`, untagged enums, and internally tagged enums keep instants, durations, positions, and exact floats. Then remove that limitation from the readme and the crate docs.
 			Kind::Instant(value) => visitor.visit_string(value.to_string()),
 			Kind::Duration(value) => visitor.visit_string(value.to_string()),
 			Kind::Array(items) => {
@@ -114,11 +134,19 @@ impl<'de> NodeDeserializer<'de> {
 		}
 	}
 
+	/**
+	The text of the value in the document, or `None` for a value that did not come from a document.
+	*/
+	fn source_text(&self) -> Option<&'de str> {
+		Some(&self.source?[self.node.offset.get()?..self.node.end])
+	}
+
 	fn visit_float<V: Visitor<'de>>(self, visitor: V, is_f32: bool) -> Result<V::Value, Error> {
 		match self.node.kind {
 			// An int reads into a float only when the float holds it exactly.
 			Kind::Int(value) => {
 				let float = value as f64;
+				// `read_back` is an `i128`, because `i64::MAX` rounds up to 2⁶³ as a float, and a cast to `i64` would saturate that back to `i64::MAX`, so the int would seem exact.
 				let read_back = if is_f32 {
 					(value as f32) as i128
 				} else {
@@ -132,6 +160,19 @@ impl<'de> NodeDeserializer<'de> {
 				}
 
 				visitor.visit_f64(float)
+			}
+			Kind::Float(value) if is_f32 => {
+				let float = self.source_text().map_or_else(
+					|| narrow(value),
+					|text| {
+						text.replace('_', "")
+							.parse()
+							.expect("a SOML float is a valid Rust float")
+					},
+				);
+
+				// Zero has one value whatever its sign.
+				visitor.visit_f32(if float == 0.0 { 0.0 } else { float })
 			}
 			_ => self.visit_if(
 				|kind| !matches!(kind, Kind::Instant(_) | Kind::Duration(_)),
@@ -160,14 +201,24 @@ impl<'de> NodeDeserializer<'de> {
 	*/
 	fn visit_token<V: Visitor<'de>>(self, name: &str, visitor: V) -> Result<V::Value, Error> {
 		match (name, &self.node.kind) {
-			(crate::instant::TOKEN, Kind::Instant(value)) => {
-				visitor.visit_string(value.to_string())
-			}
-			(crate::duration::TOKEN, Kind::Duration(value)) => {
-				visitor.visit_string(value.to_string())
-			}
+			(crate::instant::TOKEN, Kind::Instant(value)) => self.visit_text(value, visitor),
+			(crate::duration::TOKEN, Kind::Duration(value)) => self.visit_text(value, visitor),
 			(crate::instant::TOKEN, _) => Err(self.invalid_type(&"an instant")),
 			_ => Err(self.invalid_type(&"a duration")),
+		}
+	}
+
+	/**
+	Gives an instant or a duration as its text: the text in the document, which needs no copy, or else its canonical text.
+	*/
+	fn visit_text<V: Visitor<'de>>(
+		&self,
+		value: &impl std::fmt::Display,
+		visitor: V,
+	) -> Result<V::Value, Error> {
+		match self.source_text() {
+			Some(text) => visitor.visit_borrowed_str(text),
+			None => visitor.visit_string(value.to_string()),
 		}
 	}
 
@@ -349,7 +400,7 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
 	}
 
 	fn deserialize_struct<V: Visitor<'de>>(
-		self,
+		mut self,
 		name: &'static str,
 		fields: &'static [&'static str],
 		visitor: V,
@@ -361,6 +412,16 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
 			&& fields.contains(&"nanos")
 		{
 			return self.located(|this| this.visit_std_duration(visitor));
+		}
+
+		// An adjacently tagged enum asks for its tag and its content, in that order, and buffers the content when it comes first, which loses its SOML type and its position.
+		if let [tag, content] = fields
+			&& let Kind::Object(object) = &mut self.node.kind
+			&& let [(first, _), (second, _)] = object.members.as_slice()
+			&& first == content
+			&& second == tag
+		{
+			object.members.swap(0, 1);
 		}
 
 		self.deserialize_map(visitor)
@@ -380,6 +441,7 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
 	}
 
 	fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+		// A parsed tree is already checked, and a tree from a `Value` has no text to check, so an ignored value needs no work.
 		visitor.visit_unit()
 	}
 
@@ -406,14 +468,12 @@ impl<'de> SeqAccess<'de> for SeqDeserializer<'de> {
 		};
 
 		// An error that a type makes after reading, such as a check in `#[serde(try_from)]`, is about this item.
-		let offset = node.offset;
-
-		seed.deserialize(NodeDeserializer {
+		NodeDeserializer {
 			node,
 			source: self.source,
-		})
+		}
+		.located(|this| seed.deserialize(this))
 		.map(Some)
-		.map_err(|error| error.or_at(self.source, offset.get()))
 	}
 
 	fn size_hint(&self) -> Option<usize> {
@@ -462,13 +522,11 @@ impl<'de> MapAccess<'de> for ObjectDeserializer<'de> {
 			.expect("serde calls next_key_seed before next_value_seed");
 
 		// An error that a type makes after reading, such as a check in `#[serde(try_from)]`, is about this value.
-		let offset = node.offset;
-
-		seed.deserialize(NodeDeserializer {
+		NodeDeserializer {
 			node,
 			source: self.source,
-		})
-		.map_err(|error| error.or_at(self.source, offset.get()))
+		}
+		.located(|this| seed.deserialize(this))
 	}
 
 	fn size_hint(&self) -> Option<usize> {
@@ -660,6 +718,16 @@ struct TokenEnum {
 	text: String,
 }
 
+impl TokenEnum {
+	/**
+	The error for a visitor that reads the variant as anything but the text.
+	*/
+	#[cold]
+	fn not_text() -> Error {
+		de::Error::custom("expected the text of an instant or a duration")
+	}
+}
+
 impl<'de> EnumAccess<'de> for TokenEnum {
 	type Error = Error;
 	type Variant = Self;
@@ -674,9 +742,7 @@ impl<'de> VariantAccess<'de> for TokenEnum {
 	type Error = Error;
 
 	fn unit_variant(self) -> Result<(), Error> {
-		Err(de::Error::custom(
-			"expected the text of an instant or a duration",
-		))
+		Err(TokenEnum::not_text())
 	}
 
 	fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
@@ -688,9 +754,7 @@ impl<'de> VariantAccess<'de> for TokenEnum {
 		_length: usize,
 		_visitor: V,
 	) -> Result<V::Value, Error> {
-		Err(de::Error::custom(
-			"expected the text of an instant or a duration",
-		))
+		Err(TokenEnum::not_text())
 	}
 
 	fn struct_variant<V: Visitor<'de>>(
@@ -698,9 +762,7 @@ impl<'de> VariantAccess<'de> for TokenEnum {
 		_fields: &'static [&'static str],
 		_visitor: V,
 	) -> Result<V::Value, Error> {
-		Err(de::Error::custom(
-			"expected the text of an instant or a duration",
-		))
+		Err(TokenEnum::not_text())
 	}
 }
 
@@ -799,6 +861,7 @@ impl<'de> MapAccess<'de> for SpannedDeserializer<'de> {
 	fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
 		let (start, end) = self.span.unwrap_or_default();
 
+		// `next_key_seed` already moved `step` past the key it gave, so 1 is the start and 2 is the end.
 		match self.step {
 			1 => seed.deserialize((start as u64).into_deserializer()),
 			2 => seed.deserialize((end as u64).into_deserializer()),

@@ -96,6 +96,70 @@ fn a_value_from_elsewhere_has_no_span() {
 }
 
 #[test]
+fn a_value_read_through_a_json_value_has_no_span() {
+	#[derive(serde::Deserialize)]
+	struct Config {
+		port: Spanned<u16>,
+		hosts: Spanned<Vec<Spanned<String>>>,
+		limits: Spanned<BTreeMap<String, Spanned<f64>>>,
+		owner: Option<Spanned<String>>,
+	}
+
+	let json =
+		serde_json::json!({"port": 80, "hosts": ["a"], "limits": {"cpu": 0.5}, "owner": null});
+	let config: Config = serde_json::from_value(json).expect("valid");
+	assert_eq!((*config.port, config.port.span()), (80, None));
+	assert_eq!(*config.hosts[0], "a");
+	assert_eq!(config.hosts[0].span(), None);
+	assert_eq!(*config.limits["cpu"], 0.5);
+	assert_eq!(config.limits.span(), None);
+	assert!(config.owner.is_none());
+}
+
+#[test]
+fn a_value_from_a_deserializer_that_reads_a_newtype_struct_as_its_content_has_no_span() {
+	use serde::Deserialize;
+	use serde::de::IntoDeserializer;
+	use serde::de::value::{Error, MapDeserializer, SeqDeserializer};
+
+	fn read<'de, T: Deserialize<'de>>(
+		deserializer: impl serde::Deserializer<'de, Error = Error>,
+	) -> Spanned<T> {
+		let spanned = Spanned::<T>::deserialize(deserializer).expect("a value");
+		assert_eq!(spanned.span(), None);
+		spanned
+	}
+
+	// serde's own deserializers give a newtype struct's content, as some config and environment variable crates do.
+	assert_eq!(*read::<u32>(5u32.into_deserializer()), 5);
+	assert_eq!(*read::<i64>((-5i64).into_deserializer()), -5);
+	assert_eq!(*read::<f64>(1.5f64.into_deserializer()), 1.5);
+	assert!(*read::<bool>(true.into_deserializer()));
+	assert_eq!(*read::<char>('é'.into_deserializer()), 'é');
+	assert_eq!(*read::<String>("x".into_deserializer()), "x");
+	assert_eq!(*read::<String>("y".to_owned().into_deserializer()), "y");
+	assert_eq!(*read::<()>(().into_deserializer()), ());
+	assert_eq!(*read::<Option<u8>>(().into_deserializer()), None);
+	assert_eq!(
+		*read::<Vec<u8>>(SeqDeserializer::new([1u8, 2].into_iter())),
+		vec![1, 2]
+	);
+
+	#[derive(Deserialize, Debug, PartialEq)]
+	enum Mode {
+		Fast,
+	}
+
+	assert_eq!(*read::<Mode>("Fast".into_deserializer()), Mode::Fast);
+
+	let map: BTreeMap<String, Spanned<u32>> = BTreeMap::deserialize(
+		MapDeserializer::<_, Error>::new([("a".to_owned(), 5u32)].into_iter()),
+	)
+	.expect("a map");
+	assert_eq!(*map["a"], 5);
+}
+
+#[test]
 fn a_spanned_value_serializes_and_compares_as_its_value() {
 	assert_eq!(
 		soml::to_string(&BTreeMap::from([("a", Spanned::new(1))])).expect("written"),

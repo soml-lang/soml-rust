@@ -1,0 +1,56 @@
+[package]
+name = "soml-lang"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98"
+authors = ["Sindre Sorhus <sindresorhus@gmail.com>"]
+description = "SOML, a config format for humans: a strict reader, serde support, and a lossless syntax tree"
+license = "MIT"
+repository = "https://github.com/soml-lang/soml-rust"
+categories = [
+	"config",
+	"encoding",
+	"parser-implementations"
+]
+keywords = [
+	"soml",
+	"config",
+	"serde",
+	"parser",
+	"serialization"
+]
+readme = "readme.md"
+include = [
+	"src/**",
+	"license",
+	# Read by `include_str!` in the doctest shim, so `cargo test` needs it as much as the readme field does.
+	"readme.md",
+	# The tests run against the conformance suite, so the packaged crate must carry it for its tests to pass.
+	"tests/**"
+]
+
+[lib]
+# The package name is `soml-lang`, because `soml` is taken on crates.io, but code says `soml::from_str`.
+name = "soml"
+
+[features]
+# Conversions between jiff's `Timestamp` and `SignedDuration` and this crate's `Instant` and `Duration`, and modules for `#[serde(with)]`.
+jiff = ["dep:jiff"]
+# Conversions between chrono's `DateTime<Utc>` and `TimeDelta` and this crate's `Instant` and `Duration`, and modules for `#[serde(with)]`.
+chrono = ["dep:chrono"]
+
+[dependencies]
+serde_core = "1.0.229"
+zmij = "1.0.23"
+chrono = { version = "0.4.45", optional = true, default-features = false }
+jiff = { version = "0.2.37", optional = true, default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dev-dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["serde"] }
+jiff = { version = "0.2.37", features = ["serde"] }
+proptest = "1.8"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

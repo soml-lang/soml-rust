@@ -13,7 +13,3 @@ toml = "1"
 toml_edit = "0.25"
 # The ISO 8601 durations of JSON and TOML, and the instants of JSON, read as a user of those formats reads them.
 jiff = { version = "0.2.37", default-features = false, features = ["serde", "std"] }
-
-[profile.release]
-# Symbols for `xctrace` and other profilers.
-debug = true

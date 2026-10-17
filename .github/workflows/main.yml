@@ -39,9 +39,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: bench
-      - run: cargo run --release --locked --manifest-path bench/Cargo.toml
+      - run: cargo run --release --locked --package soml-lang-bench
   # A short run of every fuzz target, which finds what the tests do not try. The corpus folder is not in Git, so each target starts from the conformance cases.
   fuzz:
     runs-on: ubuntu-latest

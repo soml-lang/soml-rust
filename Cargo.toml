@@ -54,3 +54,12 @@ jiff = { version = "0.2.37", features = ["serde"] }
 proptest = "1.8"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+# The benchmark shares the lock file, so a version bump updates it too. The fuzz crate is built by cargo-fuzz on nightly, so it stays out.
+[workspace]
+members = ["bench"]
+exclude = ["fuzz"]
+
+[profile.release]
+# Symbols for `xctrace` and other profilers.
+debug = true
